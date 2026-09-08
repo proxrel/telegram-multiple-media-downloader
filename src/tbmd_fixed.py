@@ -16,6 +16,8 @@ from telethon.tl.types import (
     InputMessagesFilterDocument,
 )
 
+from FastTelethon import download_file as fast_parallel_download
+
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = BASE_DIR.parent
 
@@ -32,6 +34,11 @@ FAILED_DOWNLOADS_FILE = BASE_DIR / "failed_downloads.json"
 DOWNLOADS_DIR = BASE_DIR / "downloads"
 SIZE_TOLERANCE_MB = 0.01
 MAX_RETRY = int(os.getenv("MAX_RETRY", "3"))
+
+# Parallel ("fast") download support - only kicks in for documents/videos at
+# or above this size, since small files aren't worth the extra connections.
+USE_FAST_DOWNLOAD = os.getenv("USE_FAST_DOWNLOAD", "1") == "1"
+FAST_DOWNLOAD_MIN_MB = float(os.getenv("FAST_DOWNLOAD_MIN_MB", "5"))
 
 
 def save_credentials_to_env(entered_api_id, entered_api_hash):
@@ -438,14 +445,37 @@ async def download_file(message, folder_path: Path, progress_bars, existing_size
             progress_bar.n = 0
             progress_bar.refresh()
 
-            downloaded_path = await message.download_media(
-                file=str(destination),
-                progress_callback=lambda current, total: (
-                    progress_bar.update(current - progress_bar.n)
-                    if total
-                    else None
-                ),
+            progress_callback = lambda current, total: (
+                progress_bar.update(current - progress_bar.n)
+                if total
+                else None
             )
+
+            # Large documents/videos go through FastTelethon's multi-connection
+            # parallel downloader (github.com/painor's FastTelethon.py, MIT).
+            # Small files and photos keep using the plain Telethon path -
+            # opening several parallel connections for a 200 KB thumbnail
+            # would only add overhead and flood-wait risk for no benefit.
+            use_fast_download = (
+                USE_FAST_DOWNLOAD
+                and message.document
+                and file_size >= FAST_DOWNLOAD_MIN_MB * 1024 * 1024
+            )
+
+            if use_fast_download:
+                with open(destination, "wb") as out_file:
+                    await fast_parallel_download(
+                        message.client,
+                        message.document,
+                        out_file,
+                        progress_callback=progress_callback,
+                    )
+                downloaded_path = str(destination)
+            else:
+                downloaded_path = await message.download_media(
+                    file=str(destination),
+                    progress_callback=progress_callback,
+                )
 
             if not downloaded_path:
                 raise RuntimeError("Telegram returned no output file path.")

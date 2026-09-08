@@ -27,8 +27,8 @@ Telegram Batch Media Downloader is a fork of [Telegram Bulk Media Downloader](ht
 Clone the repository:
 
 ```
-git clone https://github.com/proxrel/telegram-multiple-media-downlaoder.git
-cd telegram-multiple-media-downlaoder
+git clone https://github.com/proxrel/telegram-multiple-media-downloader.git
+cd telegram-multiple-media-downloader
 ```
 
 Install dependencies:

@@ -1,0 +1,14 @@
+.env
+*.session
+*.session-journal
+last_channel.json
+downloads/
+__pycache__/
+*.pyc
+build/
+dist/
+venv/
+.venv/
+*.docx
+.vscode/
+.idea/

@@ -32,21 +32,63 @@ SIZE_TOLERANCE_MB = 0.01
 MAX_RETRY = 1
 
 
+def save_credentials_to_env(entered_api_id, entered_api_hash):
+    """Persist the entered credentials to a .env file so the user is not asked again."""
+    env_path = PROJECT_DIR / ".env"
+    lines = []
+    if env_path.exists():
+        with env_path.open("r", encoding="utf-8") as file:
+            lines = file.readlines()
+
+    def upsert(lines, key, value):
+        for index, line in enumerate(lines):
+            if line.strip().startswith(f"{key}="):
+                lines[index] = f"{key}={value}\n"
+                return lines
+        lines.append(f"{key}={value}\n")
+        return lines
+
+    lines = upsert(lines, "API_ID", entered_api_id)
+    lines = upsert(lines, "API_HASH", entered_api_hash)
+    if not any(line.strip().startswith("SESSION_NAME=") for line in lines):
+        lines.append("SESSION_NAME=default_session\n")
+    if not any(line.strip().startswith("BATCH_SIZE=") for line in lines):
+        lines.append("BATCH_SIZE=5\n")
+
+    with env_path.open("w", encoding="utf-8") as file:
+        file.writelines(lines)
+
+
+def prompt_for_credentials():
+    """Ask the user for API_ID / API_HASH interactively when .env is missing them."""
+    global api_id_value, api_hash
+
+    print(f"{Fore.YELLOW}Telegram API configuration was not found.{Style.RESET_ALL}")
+    print(
+        "Telegram API ayarlari bulunamadi. Degerleri simdi girebilirsin "
+        "(https://my.telegram.org adresinden alabilirsin).\n"
+    )
+
+    while True:
+        entered_id = input("API_ID: ").strip()
+        if entered_id.isdigit():
+            break
+        print(f"{Fore.RED}API_ID must be a number. / API_ID sayisal olmalidir.{Style.RESET_ALL}")
+
+    entered_hash = input("API_HASH: ").strip()
+    while not entered_hash:
+        print(f"{Fore.RED}API_HASH cannot be empty. / API_HASH bos birakilamaz.{Style.RESET_ALL}")
+        entered_hash = input("API_HASH: ").strip()
+
+    api_id_value = entered_id
+    api_hash = entered_hash
+    save_credentials_to_env(entered_id, entered_hash)
+    print(f"{Fore.GREEN}Saved to .env. / .env dosyasina kaydedildi.{Style.RESET_ALL}\n")
+
+
 def validate_configuration():
     if not api_id_value or not api_hash:
-        print(f"{Fore.RED}Telegram API configuration was not found.{Style.RESET_ALL}")
-        print(
-            "Create a .env file in the project folder and add:\n"
-            "API_ID=your_api_id\n"
-            "API_HASH=your_api_hash\n"
-            "SESSION_NAME=default_session\n"
-            "BATCH_SIZE=5"
-        )
-        print(
-            "\nTelegram API ayarlari bulunamadi. Proje klasorunde bir .env "
-            "dosyasi olusturup API_ID ve API_HASH degerlerinizi ekleyin."
-        )
-        raise SystemExit(1)
+        prompt_for_credentials()
 
     try:
         return int(api_id_value)

@@ -46,6 +46,16 @@ SESSION_NAME=default_session
 BATCH_SIZE=5
 ```
 
+You can find your API_ID and API_HASH like this:
+
+1. Go to https://my.telegram.org and log in with your Telegram account (phone number + the code sent to you).
+2. After logging in, click "API development tools".
+3. Fill in the form (e.g. "App title" and "Short name" — any name works, it doesn't matter).
+4. Click "Create application".
+5. On the resulting page you'll see your **api_id** (a number) and **api_hash** (a long alphanumeric string).
+6. Copy these two values into the `API_ID` and `API_HASH` fields in your `.env` file.
+
+
 Run the script:
 
 ```

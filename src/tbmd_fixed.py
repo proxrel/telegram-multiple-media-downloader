@@ -36,9 +36,17 @@ SIZE_TOLERANCE_MB = 0.01
 MAX_RETRY = int(os.getenv("MAX_RETRY", "3"))
 
 # Parallel ("fast") download support - only kicks in for documents/videos at
-# or above this size, since small files aren't worth the extra connections.
+# or above this size, since small/medium files aren't worth the extra
+# connection setup overhead. Default raised to 50 MB: below that, the cost of
+# opening N new connections per file (handshake + possible cross-DC auth
+# export) tends to outweigh any bandwidth gain, especially when several
+# files are already downloading at once via BATCH_SIZE.
 USE_FAST_DOWNLOAD = os.getenv("USE_FAST_DOWNLOAD", "1") == "1"
-FAST_DOWNLOAD_MIN_MB = float(os.getenv("FAST_DOWNLOAD_MIN_MB", "5"))
+FAST_DOWNLOAD_MIN_MB = float(os.getenv("FAST_DOWNLOAD_MIN_MB", "50"))
+# Capped well below FastTelethon's own default (up to 20). BATCH_SIZE files
+# can each open this many connections at the same time, so keep the product
+# (BATCH_SIZE x this) reasonable to avoid flood-waits / contention.
+FAST_DOWNLOAD_MAX_CONNECTIONS = int(os.getenv("FAST_DOWNLOAD_MAX_CONNECTIONS", "4"))
 
 
 def save_credentials_to_env(entered_api_id, entered_api_hash):
@@ -469,6 +477,7 @@ async def download_file(message, folder_path: Path, progress_bars, existing_size
                         message.document,
                         out_file,
                         progress_callback=progress_callback,
+                        connection_count=FAST_DOWNLOAD_MAX_CONNECTIONS,
                     )
                 downloaded_path = str(destination)
             else:

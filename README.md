@@ -41,8 +41,8 @@ Telegram API credentials (API ID and API Hash)
 Clone the repository:
 
 ```
-git clone https://github.com/proxrel/telegram-multiple-downlaoder.git
-cd telegram-multiple-downlaoder
+git clone https://github.com/proxrel/telegram-multiple-media-downlaoder.git
+cd telegram-multiple-media-downlaoder
 ```
 
 Install dependencies:

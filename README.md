@@ -1,6 +1,6 @@
-# Telegram Batch Media Downloader
+# Telegram Multiple Media Downloader
 
-Telegram Batch Media Downloader is a fork of [Telegram Bulk Media Downloader](https://github.com/vinodkr494/telegram-media-downloader), a Python-based tool that allows users to download various types of media files (videos, images, PDFs, ZIPs, etc.) from Telegram channels and groups. The downloader supports resumable downloads, batch processing, and progress tracking, making it ideal for managing large volumes of media efficiently.
+Telegram Multiple Media Downloader is a fork of [Telegram Bulk Media Downloader](https://github.com/vinodkr494/telegram-media-downloader), a Python-based tool that allows users to download various types of media files (videos, images, PDFs, ZIPs, etc.) from Telegram channels and groups. The downloader supports resumable downloads, batch processing, and progress tracking, making it ideal for managing large volumes of media efficiently.
 
 ## Features
 

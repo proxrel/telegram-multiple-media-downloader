@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from colorama import Fore, Style
 from tqdm.asyncio import tqdm
 from telethon import TelegramClient, functions
+from telethon.errors import FloodWaitError, RPCError
 from telethon.tl.types import (
     InputMessagesFilterVideo,
     InputMessagesFilterPhotos,
@@ -27,9 +28,10 @@ session_name = os.getenv("SESSION_NAME", "default_session")
 batch_size = int(os.getenv("BATCH_SIZE", "5"))
 
 LAST_CHANNEL_FILE = BASE_DIR / "last_channel.json"
+FAILED_DOWNLOADS_FILE = BASE_DIR / "failed_downloads.json"
 DOWNLOADS_DIR = BASE_DIR / "downloads"
 SIZE_TOLERANCE_MB = 0.01
-MAX_RETRY = 1
+MAX_RETRY = int(os.getenv("MAX_RETRY", "3"))
 
 
 def save_credentials_to_env(entered_api_id, entered_api_hash):
@@ -125,6 +127,58 @@ def save_last_channel(chat_input: str):
             f"{Style.RESET_ALL}"
         )
         print(f"Son kanal bilgisi kaydedilemedi: {error}")
+
+
+def load_failed_downloads():
+    """Return the list of previously failed download records (may be empty)."""
+    if FAILED_DOWNLOADS_FILE.exists():
+        try:
+            with FAILED_DOWNLOADS_FILE.open("r", encoding="utf-8") as file:
+                data = json.load(file)
+                if isinstance(data, list):
+                    return data
+        except (OSError, json.JSONDecodeError):
+            return []
+    return []
+
+
+def save_failed_downloads(records):
+    try:
+        with FAILED_DOWNLOADS_FILE.open("w", encoding="utf-8") as file:
+            json.dump(records, file, ensure_ascii=False, indent=2)
+    except OSError as error:
+        print(
+            f"{Fore.RED}Could not save the failed downloads list: {error}"
+            f"{Style.RESET_ALL}"
+        )
+        print(f"Hatali indirme listesi kaydedilemedi: {error}")
+
+
+def update_failed_records(channel_id, folder_path: Path, attempted_ids, new_failed_records):
+    """
+    Refresh failed_downloads.json for one (channel, folder) batch: drop every
+    previously-logged entry that belonged to this batch (it was just retried,
+    either succeeding now or reappearing in new_failed_records), then add the
+    fresh failures back in. This keeps the file in sync automatically after
+    every normal run and every retry-only run, without needing a separate
+    "remove on success" step.
+    """
+    existing = load_failed_downloads()
+    folder_str = str(folder_path)
+
+    remaining = [
+        record
+        for record in existing
+        if not (
+            record.get("channel_id") == channel_id
+            and record.get("folder_path") == folder_str
+            and record.get("message_id") in attempted_ids
+        )
+    ]
+
+    remaining.extend(new_failed_records)
+    save_failed_downloads(remaining)
+    return remaining
 
 
 def ask_yes_no(question_en: str, question_tr: str) -> bool:
@@ -317,6 +371,19 @@ def size_already_exists(
 # Indirme mantigi
 # ---------------------------------------------------------------------------
 async def download_file(message, folder_path: Path, progress_bars, existing_sizes):
+    # Guard: a message can slip through the server-side filter without any
+    # media Telethon actually knows how to download (e.g. a webpage preview,
+    # a poll, or media that has since been removed). Attempting these always
+    # returns None from download_media(), so skip them immediately instead
+    # of burning retries on a request that can never succeed.
+    if not (message.photo or message.video or message.document):
+        print(
+            f"{Fore.RED}Message {message.id} has no downloadable media and was skipped. "
+            f"(Mesaj {message.id} indirilebilir medya icermiyor, atlandi.)"
+            f"{Style.RESET_ALL}"
+        )
+        return False
+
     file_size = get_message_file_size(message)
 
     if size_already_exists(file_size, existing_sizes):
@@ -327,7 +394,7 @@ async def download_file(message, folder_path: Path, progress_bars, existing_size
             f"{Style.RESET_ALL}"
         )
         print(f"Atlandi: zaten indirilmis (~{size_mb} MB) - Mesaj ID: {message.id}")
-        return
+        return True
 
     progress_bar = tqdm(
         total=file_size,
@@ -344,14 +411,22 @@ async def download_file(message, folder_path: Path, progress_bars, existing_size
     )
     progress_bars.append(progress_bar)
 
-    custom_name = None
+    # Filename is always prefixed with the message ID so two messages that
+    # share the same caption text can never resolve to the same destination
+    # path. Concurrent downloads inside a batch (batch_size, default 5) used
+    # to be able to collide on identical captions, so two coroutines wrote to
+    # the exact same file at the same time - Telethon's own ".temp" file for
+    # that path got overwritten mid-write by the other task, and the loser
+    # of that race got back None instead of a path ("Telegram returned no
+    # output file path"). Making every destination unique removes that race
+    # entirely.
     if message.text:
-        custom_name = safe_filename(
-            message.text.strip(),
-            guess_extension(message),
-        )
+        base_name = safe_filename(message.text.strip(), guess_extension(message))
+    else:
+        base_name = safe_filename("", guess_extension(message))
 
-    destination = folder_path / custom_name if custom_name else folder_path
+    custom_name = safe_filename(f"{message.id} - {base_name}", guess_extension(message))
+    destination = folder_path / custom_name
 
     success = False
     last_error = None
@@ -378,16 +453,31 @@ async def download_file(message, folder_path: Path, progress_bars, existing_size
             success = True
             break
 
-        except Exception as error:
+        except FloodWaitError as error:
             last_error = error
+            wait_seconds = getattr(error, "seconds", 5) + 1
 
             if attempt < max_attempts:
                 print(
-                    f"{Fore.YELLOW}Message {message.id} failed. Retrying once... "
-                    f"(Mesaj {message.id} indirilemedi, bir kez daha deneniyor.) "
-                    f"Error: {error}{Style.RESET_ALL}"
+                    f"{Fore.YELLOW}Rate limited on message {message.id}. "
+                    f"Waiting {wait_seconds}s before retrying... "
+                    f"(Mesaj {message.id} icin hiz siniri; {wait_seconds}sn "
+                    f"beklenip tekrar denenecek.){Style.RESET_ALL}"
                 )
-                await asyncio.sleep(2)
+                await asyncio.sleep(wait_seconds)
+
+        except (RPCError, RuntimeError, OSError, ConnectionError) as error:
+            last_error = error
+
+            if attempt < max_attempts:
+                backoff_seconds = 2 * attempt
+                print(
+                    f"{Fore.YELLOW}Message {message.id} failed (attempt "
+                    f"{attempt}/{max_attempts}). Retrying in {backoff_seconds}s... "
+                    f"(Mesaj {message.id} indirilemedi, {backoff_seconds}sn "
+                    f"sonra tekrar denenecek.) Error: {error}{Style.RESET_ALL}"
+                )
+                await asyncio.sleep(backoff_seconds)
 
     if success:
         progress_bar.bar_format = (
@@ -422,12 +512,18 @@ async def download_file(message, folder_path: Path, progress_bars, existing_size
         )
 
     progress_bar.close()
+    return success
 
 
-async def download_in_batches(messages, folder_path: Path, batch_size: int):
+async def download_in_batches(messages, folder_path: Path, batch_size: int, channel_id=None):
+    """Download all messages in batches and return the list of failure records
+    (each ``{"channel_id", "message_id", "folder_path"}``) so the caller can
+    persist them for a later "retry only failed downloads" run."""
     tasks = []
+    batch_messages = []
     progress_bars = []
     existing_sizes = scan_existing_sizes(folder_path)
+    failed_records = []
 
     for index, message in enumerate(messages, 1):
         tasks.append(
@@ -438,10 +534,28 @@ async def download_in_batches(messages, folder_path: Path, batch_size: int):
                 existing_sizes,
             )
         )
+        batch_messages.append(message)
 
         if len(tasks) == batch_size or index == len(messages):
-            await asyncio.gather(*tasks, return_exceptions=True)
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            for batch_message, result in zip(batch_messages, results):
+                # result is True on success, False on a handled failure, or
+                # an Exception instance if something unexpected escaped
+                # download_file's own try/except entirely.
+                if result is not True:
+                    failed_records.append(
+                        {
+                            "channel_id": channel_id,
+                            "message_id": batch_message.id,
+                            "folder_path": str(folder_path),
+                        }
+                    )
+
             tasks.clear()
+            batch_messages.clear()
+
+    return failed_records
 
 
 async def get_topic_messages(client, channel, topic_id, filter_type, limit=2000):
@@ -671,11 +785,122 @@ async def resolve_channel(client, chat_input):
     return channel
 
 
+# ---------------------------------------------------------------------------
+# Sadece hatali indirmeleri yeniden deneme
+# ---------------------------------------------------------------------------
+async def retry_failed_downloads(client):
+    """Re-attempt only the messages recorded in failed_downloads.json,
+    grouped by channel and destination folder, without re-scanning the
+    whole chat."""
+    records = load_failed_downloads()
+
+    if not records:
+        print(
+            f"{Fore.GREEN}No previously failed downloads found. "
+            f"(Kayitli hatali indirme yok.){Style.RESET_ALL}"
+        )
+        return
+
+    by_channel = {}
+    for record in records:
+        by_channel.setdefault(record.get("channel_id"), []).append(record)
+
+    for channel_id, channel_records in by_channel.items():
+        try:
+            channel = await client.get_entity(channel_id)
+            channel_title = getattr(channel, "title", str(channel_id))
+        except Exception as error:
+            print(
+                f"{Fore.RED}Could not resolve channel {channel_id}, "
+                f"keeping its entries for next time. "
+                f"(Kanal {channel_id} bulunamadi, kayitlar korunuyor.) "
+                f"Error: {error}{Style.RESET_ALL}"
+            )
+            continue
+
+        by_folder = {}
+        for record in channel_records:
+            by_folder.setdefault(record["folder_path"], []).append(record["message_id"])
+
+        for folder_str, message_ids in by_folder.items():
+            folder_path = Path(folder_str)
+            folder_path.mkdir(parents=True, exist_ok=True)
+
+            print(
+                f"\n{Fore.CYAN}=== Retrying {len(message_ids)} failed message(s) "
+                f"for '{channel_title}' -> {folder_path.name} ==="
+                f"{Style.RESET_ALL}"
+            )
+
+            try:
+                messages = await client.get_messages(channel, ids=message_ids)
+            except Exception as error:
+                print(
+                    f"{Fore.RED}Could not fetch messages: {error}"
+                    f"{Style.RESET_ALL}"
+                )
+                continue
+
+            messages = [message for message in messages if message is not None]
+            found_ids = {message.id for message in messages}
+
+            for missing_id in set(message_ids) - found_ids:
+                print(
+                    f"{Fore.YELLOW}Message {missing_id} no longer exists "
+                    f"(deleted?), removing from the retry list. "
+                    f"(Mesaj {missing_id} artik mevcut degil, listeden "
+                    f"cikariliyor.){Style.RESET_ALL}"
+                )
+
+            failed_records = await download_in_batches(
+                messages,
+                folder_path,
+                batch_size,
+                channel_id=channel_id,
+            )
+
+            update_failed_records(channel_id, folder_path, set(message_ids), failed_records)
+
+    remaining = load_failed_downloads()
+    if remaining:
+        print(
+            f"\n{Fore.YELLOW}{len(remaining)} file(s) still could not be "
+            f"downloaded and remain in failed_downloads.json. "
+            f"({len(remaining)} dosya hala indirilemedi, "
+            f"failed_downloads.json icinde kayitli kaldi.){Style.RESET_ALL}"
+        )
+    else:
+        print(
+            f"\n{Fore.GREEN}All previously failed downloads succeeded! "
+            f"(Tum hatali indirmeler basariyla tamamlandi!){Style.RESET_ALL}"
+        )
+
+
 async def main():
     session_path = BASE_DIR / session_name
 
     async with TelegramClient(str(session_path), api_id, api_hash) as client:
         print(f"{Fore.GREEN}Connected successfully!{Style.RESET_ALL}")
+
+        failed_records = load_failed_downloads()
+        if failed_records:
+            retry_only = ask_yes_no(
+                f"{len(failed_records)} previously failed download(s) found. "
+                "Retry only those now?",
+                f"Daha once basarisiz olan {len(failed_records)} dosya bulundu. "
+                "Simdi sadece onlari yeniden denemek ister misiniz?",
+            )
+
+            if retry_only:
+                await retry_failed_downloads(client)
+
+                continue_with_new = ask_yes_no(
+                    "Do you also want to start a new channel download?",
+                    "Ayrica yeni bir kanal indirmesi baslatmak ister misiniz?",
+                )
+
+                if not continue_with_new:
+                    return
 
         last_channel = load_last_channel()
         chat_input = None
@@ -747,6 +972,7 @@ async def main():
             return
 
         topics_to_process = selected_topics if selected_topics else [None]
+        total_failed = 0
 
         for topic in topics_to_process:
             if topic:
@@ -801,11 +1027,17 @@ async def main():
             )
 
             if media_messages:
-                await download_in_batches(
+                run_failed_records = await download_in_batches(
                     media_messages,
                     folder_path,
                     batch_size,
+                    channel_id=channel.id,
                 )
+                attempted_ids = {message.id for message in media_messages}
+                update_failed_records(
+                    channel.id, folder_path, attempted_ids, run_failed_records
+                )
+                total_failed += len(run_failed_records)
             else:
                 print(
                     f"{Fore.RED}No media found for the selected type. "
@@ -817,6 +1049,17 @@ async def main():
             f"{Style.RESET_ALL}"
         )
         print("Tum secilen topic'ler icin indirme tamamlandi!")
+
+        if total_failed:
+            print(
+                f"{Fore.YELLOW}{total_failed} file(s) could not be downloaded "
+                f"this run. They were saved to failed_downloads.json - run the "
+                f"script again and choose to retry only failed downloads. "
+                f"({total_failed} dosya bu calistirmada indirilemedi ve "
+                f"failed_downloads.json dosyasina kaydedildi; scripti tekrar "
+                f"calistirip 'sadece hatali indirmeleri yeniden dene' "
+                f"secenegini kullanabilirsiniz.){Style.RESET_ALL}"
+            )
 
 
 if __name__ == "__main__":

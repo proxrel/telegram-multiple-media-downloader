@@ -426,22 +426,34 @@ async def download_file(message, folder_path: Path, progress_bars, existing_size
     )
     progress_bars.append(progress_bar)
 
-    # Filename is always prefixed with the message ID so two messages that
-    # share the same caption text can never resolve to the same destination
-    # path. Concurrent downloads inside a batch (batch_size, default 5) used
-    # to be able to collide on identical captions, so two coroutines wrote to
-    # the exact same file at the same time - Telethon's own ".temp" file for
-    # that path got overwritten mid-write by the other task, and the loser
-    # of that race got back None instead of a path ("Telegram returned no
-    # output file path"). Making every destination unique removes that race
-    # entirely.
-    if message.text:
-        base_name = safe_filename(message.text.strip(), guess_extension(message))
-    else:
-        base_name = safe_filename("", guess_extension(message))
+    # Prefer Telegram's own filename for the document/video (the name the
+    # uploader actually gave the file), falling back to the message caption
+    # only when Telegram has no filename on record, and finally to "unnamed".
+    # message.file.name reads the DocumentAttributeFilename Telegram stores
+    # with the media - using message.text here was wrong, since that's the
+    # caption someone typed, not the file's real name (e.g. a caption like
+    # "_DAHILIYE-BOLUM-1.MP4_ MD5_f7a1..." would get used as the filename
+    # itself even though the actual video is named "DAHILIYE-BOLUM-1.MP4").
+    real_name = getattr(message.file, "name", None) if message.file else None
 
-    custom_name = safe_filename(f"{message.id} - {base_name}", guess_extension(message))
+    if real_name:
+        custom_name = safe_filename(real_name, guess_extension(message))
+    elif message.text:
+        custom_name = safe_filename(message.text.strip(), guess_extension(message))
+    else:
+        custom_name = safe_filename("", guess_extension(message))
+
     destination = folder_path / custom_name
+
+    # Two different messages can still carry the same real filename (or both
+    # fall back to "unnamed"), which would make them collide on the same
+    # destination path - especially risky since download_in_batches runs
+    # several downloads concurrently. Disambiguate only when needed by
+    # appending the message ID, instead of always prefixing it.
+    if destination.exists():
+        stem = destination.stem
+        suffix = destination.suffix
+        destination = folder_path / safe_filename(f"{stem} ({message.id}){suffix}")
 
     success = False
     last_error = None

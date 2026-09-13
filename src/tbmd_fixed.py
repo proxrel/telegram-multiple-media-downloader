@@ -48,6 +48,53 @@ FAST_DOWNLOAD_MIN_MB = float(os.getenv("FAST_DOWNLOAD_MIN_MB", "50"))
 # (BATCH_SIZE x this) reasonable to avoid flood-waits / contention.
 FAST_DOWNLOAD_MAX_CONNECTIONS = int(os.getenv("FAST_DOWNLOAD_MAX_CONNECTIONS", "4"))
 
+# ---------------------------------------------------------------------------
+# Hafta bazli klasorleme
+# ---------------------------------------------------------------------------
+# client.get_messages(..., filter=InputMessagesFilterVideo()) gibi cagrilar
+# Telegram'in SUNUCU TARAFLI arama filtresini kullanir: sonuc listesine sadece
+# o turdeki medya mesajlari girer, aralarindaki "1. Hafta" gibi duz metin
+# mesajlari sorguya hic yansimaz. Bu yuzden mevcut akis hafta bilgisini
+# "kacirmiyor", ona hicbir zaman erisemiyor. Cozum: sohbetin tamamini
+# filtresiz ve kronolojik sirayla taramak (bkz. fetch_messages_grouped_by_week).
+WEEK_PATTERN = re.compile(r"(\d+)\s*[.\-]?\s*hafta|hafta\s*[.\-]?\s*(\d+)", re.IGNORECASE)
+
+
+def detect_week_label(text: str):
+    """Metinde 'N. Hafta' turunden bir ifade varsa 'NN-Hafta' seklinde
+    normallestirilmis bir etiket dondurur, yoksa None."""
+    if not text:
+        return None
+    match = WEEK_PATTERN.search(text)
+    if not match:
+        return None
+    week_number = match.group(1) or match.group(2)
+    return f"{int(week_number):02d}-Hafta"
+
+
+def message_matches_choice(message, choice: str) -> bool:
+    """Ana menudeki 1-5 secimiyle ayni mantik: bir mesaj secilen medya
+    turune uyuyor mu? (get_messages'in server-side filter'inin client-side
+    karsiligi, cunku hafta taramasi sirasinda filtre kullanamiyoruz.)"""
+    if choice == "1":
+        return message.photo is not None
+    if choice == "2":
+        return message.video is not None
+    if choice == "3":
+        return (
+            message.document is not None
+            and getattr(message.document, "mime_type", "") == "application/pdf"
+        )
+    if choice == "4":
+        return (
+            message.document is not None
+            and getattr(message.document, "mime_type", "")
+            in ("application/zip", "application/x-zip-compressed")
+        )
+    if choice == "5":
+        return bool(message.photo or message.video or message.document)
+    return False
+
 
 def save_credentials_to_env(entered_api_id, entered_api_hash):
     """Persist the entered credentials to a .env file so the user is not asked again."""
@@ -635,6 +682,54 @@ async def get_topic_messages(client, channel, topic_id, filter_type, limit=2000)
     return all_messages[:limit]
 
 
+async def fetch_messages_grouped_by_week(client, channel, choice: str):
+    """
+    Sohbetin TAMAMINI, filtre uygulamadan ve eskiden yeniye (kronolojik)
+    sirayla tarar; boylece Telegram'in medya-arama filtrelerinin gorunmez
+    kildigi duz metin "N. Hafta" mesajlarini da yakalayabiliriz.
+
+    Her medya mesaji, kendisinden once en son gorulen hafta etiketinin
+    altina toplanir. Herhangi bir hafta basligindan once gelen medyalar
+    "00-Hafta-Oncesi" altina duser.
+
+    Not: Bu, sunucu taraflı filtreyle (get_messages(filter=...)) alinan
+    hizli yoldan farkli olarak butun mesaj gecmisini okur (sadece medyayi
+    degil), bu yuzden cok buyuk sohbetlerde normal indirmeden daha uzun
+    surebilir.
+    """
+    groups = {}
+    order = []
+    current_label = "00-Hafta-Oncesi"
+    scanned = 0
+
+    print(
+        f"{Fore.YELLOW}Scanning the full chat history to find week headers "
+        f"- this reads every message, not just media, so it can take a "
+        f"while on large chats. "
+        f"(Hafta basliklarini bulmak icin butun sohbet gecmisi taraniyor; "
+        f"bu sadece medyalari degil TUM mesajlari okudugu icin buyuk "
+        f"gruplarda zaman alabilir.){Style.RESET_ALL}"
+    )
+
+    async for message in client.iter_messages(channel, reverse=True):
+        scanned += 1
+        if scanned % 500 == 0:
+            print(f"  ... {scanned} mesaj tarandi / scanned")
+
+        label = detect_week_label(message.text or "")
+        if label:
+            current_label = label
+            print(f"{Fore.CYAN}  >> Week header found: {label} (msg {message.id}){Style.RESET_ALL}")
+
+        if message_matches_choice(message, choice):
+            if current_label not in groups:
+                groups[current_label] = []
+                order.append(current_label)
+            groups[current_label].append(message)
+
+    return [(label, groups[label]) for label in order]
+
+
 # ---------------------------------------------------------------------------
 # Topic, kanal ve program akisi
 # ---------------------------------------------------------------------------
@@ -1025,6 +1120,18 @@ async def main():
         topics_to_process = selected_topics if selected_topics else [None]
         total_failed = 0
 
+        # Forum topic'leri kullanilmiyorsa (cogu normal grup icin durum bu),
+        # kullaniciya sohbetteki "N. Hafta" duz metin basliklarina gore ayri
+        # klasorlere bolme secenegini sun.
+        group_by_week = False
+        if topics_to_process == [None]:
+            group_by_week = ask_yes_no(
+                "Split downloads into separate folders based on 'N. Hafta' "
+                "(week) text announcements found in the chat history?",
+                "Sohbet gecmisindeki 'N. Hafta' baslik mesajlarina gore "
+                "indirmeleri ayri klasorlere bolmek ister misiniz?",
+            )
+
         for topic in topics_to_process:
             if topic:
                 safe_topic_title = re.sub(r'[\\/*?:"<>|]', "_", topic.title)
@@ -1037,6 +1144,34 @@ async def main():
                 folder_path = DOWNLOADS_DIR / base_folder
 
             folder_path.mkdir(parents=True, exist_ok=True)
+
+            if not topic and group_by_week:
+                week_groups = await fetch_messages_grouped_by_week(client, channel, choice)
+
+                if not week_groups:
+                    print(
+                        f"{Fore.RED}No week headers or matching media were found. "
+                        f"(Hicbir hafta basligi ya da eslesen medya bulunamadi.)"
+                        f"{Style.RESET_ALL}"
+                    )
+                else:
+                    for label, week_messages in week_groups:
+                        week_folder = folder_path / label
+                        week_folder.mkdir(parents=True, exist_ok=True)
+                        print(
+                            f"\n{Fore.CYAN}=== {label}: {len(week_messages)} "
+                            f"file(s) ==={Style.RESET_ALL}"
+                        )
+                        run_failed_records = await download_in_batches(
+                            week_messages, week_folder, batch_size, channel_id=channel.id
+                        )
+                        attempted_ids = {message.id for message in week_messages}
+                        update_failed_records(
+                            channel.id, week_folder, attempted_ids, run_failed_records
+                        )
+                        total_failed += len(run_failed_records)
+
+                continue
 
             print(f"{Fore.YELLOW}Fetching media messages...{Style.RESET_ALL}")
 

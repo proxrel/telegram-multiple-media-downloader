@@ -12,3 +12,6 @@ venv/
 *.docx
 .vscode/
 .idea/
+mirrors/
+*.part
+manifest.json.tmp

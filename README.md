@@ -76,6 +76,28 @@ Select the type of media to download (e.g., videos, images, PDFs).
 
 Watch as your files are downloaded with detailed progress bars!
 
+## 🆕 Ordered Mirror — sıralı indirme ve kanala aynı sırayla gönderme
+
+`src/ordered_mirror.py` (Windows: `src/sirali aktarim.bat`) videoları, dosyaları **ve metin mesajlarını** kanaldaki orijinal sırasıyla indirir ve başka bir kanala aynı sırayla gönderir.
+
+Klasik indirici Telegram'ın sunucu filtresini kullandığı için metin mesajları hiç gelmez ve paralel indirme sırayı bozar. Bu mod sohbetin tamamını filtresiz, tarih sırasıyla tarar ve sırayı `manifest.json` içine yazar.
+
+| Mod | Ne yapar |
+|---|---|
+| 1 | Sıralı indir → `src/mirrors/<kanal>/` (`00001_...mp4`, `SIRA.txt`, `manifest.json`) |
+| 2 | İndirilmiş klasörü hedef kanala sırayla yükle |
+| 3 | 1 + 2 art arda |
+| 4 | İndirmeden doğrudan kopyala ("İletildi" etiketi olmadan). En hızlısı; **içerik korumalı kanallarda çalışmaz**, onlar için mod 3 |
+
+- Metin biçimlendirmesi (kalın, link, spoiler…), albümler, video süresi/çözünürlüğü ve küçük resimleri korunur.
+- Gönderim tek tek ve sırayla yapılır; bir öğe gönderilemezse **atlamaz, durur**. Tekrar çalıştırınca tam o öğeden devam eder (ilerleme hedef kanal bazında `manifest.json` içinde).
+- İndirme de devam ettirilebilir; tamamlanmış dosyalar tekrar inmez, yarım kalanlar `.part` olarak tutulur.
+- Aynı kanalı tekrar seçince sadece yeni mesajlar taranıp sona eklenir.
+- İsteğe bağlı başlangıç/bitiş mesaj linki ile aralık seçilebilir; forum gruplarında topic seçilebilir.
+- Yeniden yüklenemeyen türler (sticker, anket, konum) mod 2/3'te atlanır ve `SIRA.txt` içinde `ATLANDI` olarak görünür; mod 4 bunları da kopyalar.
+- `.env` içindeki `SEND_DELAY` (varsayılan 2 sn) gönderimler arası beklemedir; FloodWait gelirse otomatik beklenir.
+- Hedef kanalda mesaj gönderme yetkiniz olmalı. Kişisel hesap yükleme sınırı 2 GB (Premium 4 GB).
+
 ## Advanced Configuration
 
 ### Finding a Channel/Group ID

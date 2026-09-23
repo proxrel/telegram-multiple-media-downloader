@@ -91,6 +91,7 @@ Klasik indirici Telegram'ın sunucu filtresini kullandığı için metin mesajla
 
 - Metin biçimlendirmesi (kalın, link, spoiler…), albümler, video süresi/çözünürlüğü ve küçük resimleri korunur.
 - Gönderim tek tek ve sırayla yapılır; bir öğe gönderilemezse **atlamaz, durur**. Tekrar çalıştırınca tam o öğeden devam eder (ilerleme hedef kanal bazında `manifest.json` içinde).
+- Mod 3'te "gönderdikten sonra sil" seçilirse dosyalar küçük gruplar hâlinde indirilir, gönderilir ve hemen silinir; diskte aynı anda sadece birkaç dosya bulunur (`manifest.json` ve `SIRA.txt` kalır).
 - İndirme de devam ettirilebilir; tamamlanmış dosyalar tekrar inmez, yarım kalanlar `.part` olarak tutulur.
 - Aynı kanalı tekrar seçince sadece yeni mesajlar taranıp sona eklenir.
 - İsteğe bağlı başlangıç/bitiş mesaj linki ile aralık seçilebilir; forum gruplarında topic seçilebilir.

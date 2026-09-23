@@ -390,10 +390,10 @@ async def download_part(client, channel, message, part, folder, semaphore):
         return True
 
 
-async def download_all(client, channel, folder: Path, manifest, message_cache):
+async def download_all(client, channel, folder: Path, manifest, message_cache, items=None):
     pending = [
         part
-        for item in manifest["items"]
+        for item in (manifest["items"] if items is None else items)
         for part in item["parts"]
         if part.get("file") and not part.get("skip") and not file_is_complete(folder, part["file"])
     ]
@@ -540,12 +540,25 @@ async def send_item(client, target, folder: Path, item, silent: bool, medias):
                 )
 
 
-async def send_all(client, target, folder: Path, manifest, silent: bool):
+def delete_item_files(folder: Path, item):
+    for part in item["parts"]:
+        file_info = part.get("file")
+        if file_info:
+            (folder / file_info["name"]).unlink(missing_ok=True)
+            if file_info.get("thumb"):
+                (folder / file_info["thumb"]).unlink(missing_ok=True)
+
+
+async def send_all(client, target, folder: Path, manifest, silent: bool, upto_n=None, delete_after=False):
     key = str(target.id)
     progress = manifest.setdefault("sent", {}).setdefault(
         key, {"title": getattr(target, "title", str(target.id)), "last_n": 0}
     )
-    todo = [item for item in manifest["items"] if item["n"] > progress["last_n"]]
+    todo = [
+        item
+        for item in manifest["items"]
+        if item["n"] > progress["last_n"] and (upto_n is None or item["n"] <= upto_n)
+    ]
     if not todo:
         info("Everything has already been sent.", "Hepsi zaten gonderilmis.", Fore.GREEN)
         return
@@ -585,8 +598,13 @@ async def send_all(client, target, folder: Path, manifest, silent: bool):
 
         progress["last_n"] = item["n"]
         save_manifest(folder, manifest)
+        # Only after progress is saved: a crash in between leaves the file
+        # on disk rather than losing an unsent one.
+        if delete_after:
+            delete_item_files(folder, item)
 
-    info("All items sent in the original order.", "Tum ogeler orijinal sirayla gonderildi.", Fore.GREEN)
+    if upto_n is None:
+        info("All items sent in the original order.", "Tum ogeler orijinal sirayla gonderildi.", Fore.GREEN)
 
 
 async def forward_all(client, channel, target, folder: Path, manifest, silent: bool):
@@ -836,16 +854,45 @@ async def main():
                 await forward_all(client, channel, target, folder, manifest, silent)
                 return
 
-            failed = await download_all(client, channel, folder, manifest, message_cache)
+            if mode == "1":
+                await download_all(client, channel, folder, manifest, message_cache)
+                return
 
-            if mode == "3":
+            # Mode 3: every question is asked up front so the run can be
+            # left unattended.
+            target, silent = await ask_target_and_options(client, manifest)
+            delete_after = ask_yes_no(
+                "Delete each file from this computer right after it is sent?",
+                "Her dosya gonderildikten hemen sonra bu bilgisayardan silinsin mi?",
+            )
+            progress = manifest.get("sent", {}).get(str(target.id), {})
+            todo = [i for i in manifest["items"] if i["n"] > progress.get("last_n", 0)]
+
+            if not delete_after:
+                failed = await download_all(client, channel, folder, manifest, message_cache, todo)
                 if failed and not ask_yes_no(
                     "Some files failed. Send anyway? Sending will stop at the first missing file.",
                     "Bazi dosyalar inmedi. Yine de gonderilsin mi? Ilk eksik dosyada durur.",
                 ):
                     return
-                target, silent = await ask_target_and_options(client, manifest)
                 await send_all(client, target, folder, manifest, silent)
+                return
+
+            # Download and send in small windows so disk usage stays at a
+            # few files instead of the whole chat.
+            window = max(1, batch_size) * 2
+            for start in range(0, len(todo), window):
+                chunk = todo[start:start + window]
+                await download_all(client, channel, folder, manifest, message_cache, chunk)
+                await send_all(
+                    client, target, folder, manifest, silent,
+                    upto_n=chunk[-1]["n"], delete_after=True,
+                )
+            info(
+                "All items sent in the original order; files deleted.",
+                "Tum ogeler sirayla gonderildi, dosyalar silindi.",
+                Fore.GREEN,
+            )
         except OrderStop as stop:
             print(f"\n{Fore.RED}STOPPED: {stop}{Style.RESET_ALL}")
             info(

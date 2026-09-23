@@ -21,7 +21,7 @@ from pathlib import Path
 
 from colorama import Fore, Style
 from tqdm.asyncio import tqdm
-from telethon import TelegramClient
+from telethon import TelegramClient, functions
 from telethon.errors import (
     ChatAdminRequiredError,
     ChatForwardsRestrictedError,
@@ -704,17 +704,64 @@ async def ask_chat(client, en: str, tr: str):
             info("Chat not found, try again.", "Sohbet bulunamadi, tekrar deneyin.", Fore.RED)
 
 
+async def load_topics(client, channel):
+    topics, seen = [], set()
+    offset_date = offset_id = offset_topic = 0
+    while True:
+        result = await client(
+            functions.messages.GetForumTopicsRequest(
+                peer=channel,
+                offset_date=offset_date,
+                offset_id=offset_id,
+                offset_topic=offset_topic,
+                limit=100,
+            )
+        )
+        new = [t for t in result.topics if t.id not in seen and hasattr(t, "title")]
+        if not new:
+            break
+        seen.update(t.id for t in new)
+        topics.extend(new)
+        if len(result.topics) < 100:
+            break
+        last = result.topics[-1]
+        last_message = next((m for m in result.messages if m.id == last.top_message), None)
+        offset_topic, offset_id = last.id, last.top_message
+        offset_date = int(last_message.date.timestamp()) if last_message else 0
+    return topics
+
+
+async def pick_topic(client, channel):
+    """List the forum's topics and return the chosen topic ID (None = whole chat)."""
+    info("Loading topics...", "Alt basliklar yukleniyor...")
+    try:
+        topics = await load_topics(client, channel)
+    except RPCError as error:
+        info(f"Could not load topics: {error}", "Alt basliklar yuklenemedi, tum sohbet kullanilacak.", Fore.RED)
+        return None
+    if not topics:
+        return None
+
+    print(f"\n{Fore.CYAN}Topics / Alt basliklar ({len(topics)}):{Style.RESET_ALL}")
+    print("  0. Whole chat (Tum sohbet)")
+    for index, topic in enumerate(topics, 1):
+        print(f"  {index}. {topic.title}")
+    while True:
+        raw = input(f"{Fore.CYAN}Select topic (Alt baslik secin) (0-{len(topics)}): {Style.RESET_ALL}").strip()
+        if raw.isdigit() and 0 <= int(raw) <= len(topics):
+            break
+    if raw == "0":
+        return None
+    topic = topics[int(raw) - 1]
+    info(f"Selected topic: {topic.title} (ID {topic.id})", "Alt baslik secildi", Fore.GREEN)
+    return topic.id
+
+
 async def prepare_source(client, message_cache):
     channel = await ask_chat(
         client, "Source channel/group (link, @username, ID or name)", "Kaynak kanal/grup"
     )
-    topic_id = None
-    if getattr(channel, "forum", False):
-        raw = input(
-            f"{Fore.CYAN}Forum topic ID or link (empty = whole chat) "
-            f"(Topic ID/linki, bos = tum sohbet): {Style.RESET_ALL}"
-        ).strip()
-        topic_id = parse_message_id(raw) or None
+    topic_id = await pick_topic(client, channel) if getattr(channel, "forum", False) else None
 
     title = safe_filename(getattr(channel, "title", "chat"))[:60]
     base_name = f"{title}_{abs(channel.id)}" + (f"_t{topic_id}" if topic_id else "")

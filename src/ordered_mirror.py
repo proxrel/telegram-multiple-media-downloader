@@ -722,7 +722,9 @@ async def prepare_source(client, message_cache):
     existing = [
         p
         for p in MIRRORS_DIR.iterdir()
-        if (p.name == base_name or p.name.startswith(base_name + "_"))
+        # Only this exact chat/topic, optionally with a range suffix; a
+        # whole-chat run must not pick up a topic folder (or vice versa).
+        if re.fullmatch(re.escape(base_name) + r"(_(\d+|bas)-(\d+|son))?", p.name)
         and (p / MANIFEST_NAME).exists()
     ]
     folder = None

@@ -484,7 +484,7 @@ async def build_media(client, folder: Path, file_info):
     )
 
 
-async def send_item(client, target, folder: Path, item, silent: bool, medias):
+async def send_item(client, target, folder: Path, item, silent: bool, medias, topic_id=None):
     parts = [p for p in item["parts"] if not p.get("skip")]
     media_parts = [p for p in parts if p.get("file")]
     texts = [p["text"] for p in parts]
@@ -500,6 +500,7 @@ async def send_item(client, target, folder: Path, item, silent: bool, medias):
             parse_mode=None,
             link_preview=item.get("link_preview", False),
             silent=silent,
+            reply_to=topic_id,
         )
         return
 
@@ -516,6 +517,7 @@ async def send_item(client, target, folder: Path, item, silent: bool, medias):
                 formatting_entities=entities[0] or None,
                 parse_mode=None,
                 silent=silent,
+                reply_to=topic_id,
             )
         else:
             await client.send_file(
@@ -525,18 +527,21 @@ async def send_item(client, target, folder: Path, item, silent: bool, medias):
                 formatting_entities=entities,
                 parse_mode=None,
                 silent=silent,
+                reply_to=topic_id,
             )
     except MediaCaptionTooLongError:
         # The source was posted by a Premium account with a longer caption
         # limit than ours: post the media bare, then the text right after it.
         # Re-upload, since the failed request may have consumed the file parts.
         medias[:] = [await build_media(client, folder, p["file"]) for p in media_parts]
-        await client.send_file(target, medias if len(medias) > 1 else medias[0], silent=silent)
+        await client.send_file(
+            target, medias if len(medias) > 1 else medias[0], silent=silent, reply_to=topic_id,
+        )
         for text, ents in zip(texts, entities):
             if text.strip():
                 await client.send_message(
                     target, text, formatting_entities=ents or None, parse_mode=None,
-                    link_preview=False, silent=silent,
+                    link_preview=False, silent=silent, reply_to=topic_id,
                 )
 
 
@@ -549,7 +554,7 @@ def delete_item_files(folder: Path, item):
                 (folder / file_info["thumb"]).unlink(missing_ok=True)
 
 
-async def send_all(client, target, folder: Path, manifest, silent: bool, upto_n=None, delete_after=False):
+async def send_all(client, target, folder: Path, manifest, silent: bool, upto_n=None, delete_after=False, topic_id=None):
     key = str(target.id)
     progress = manifest.setdefault("sent", {}).setdefault(
         key, {"title": getattr(target, "title", str(target.id)), "last_n": 0}
@@ -572,7 +577,7 @@ async def send_all(client, target, folder: Path, manifest, silent: bool, upto_n=
             attempt = 0
             while True:
                 try:
-                    await send_item(client, target, folder, item, silent, medias)
+                    await send_item(client, target, folder, item, silent, medias, topic_id)
                     break
                 except FloodWaitError as error:
                     info(f"Flood wait {error.seconds}s...", f"Telegram {error.seconds}sn bekletiyor...", Fore.YELLOW)
@@ -607,7 +612,7 @@ async def send_all(client, target, folder: Path, manifest, silent: bool, upto_n=
         info("All items sent in the original order.", "Tum ogeler orijinal sirayla gonderildi.", Fore.GREEN)
 
 
-async def forward_all(client, channel, target, folder: Path, manifest, silent: bool):
+async def forward_all(client, channel, target, folder: Path, manifest, silent: bool, topic_id=None):
     """Copy without downloading: forward in order with the 'Forwarded from'
     header removed. Albums are never split across requests."""
     key = str(target.id)
@@ -621,9 +626,23 @@ async def forward_all(client, channel, target, folder: Path, manifest, silent: b
         ids = [p["msg_id"] for item in chunk_items for p in item["parts"]]
         while True:
             try:
-                await client.forward_messages(
-                    target, ids, from_peer=channel, drop_author=True, silent=silent
-                )
+                if topic_id:
+                    # The high-level forward_messages() has no way to target a
+                    # specific topic, so the raw request is used directly.
+                    await client(
+                        functions.messages.ForwardMessagesRequest(
+                            from_peer=channel,
+                            id=ids,
+                            to_peer=target,
+                            drop_author=True,
+                            silent=silent,
+                            top_msg_id=topic_id,
+                        )
+                    )
+                else:
+                    await client.forward_messages(
+                        target, ids, from_peer=channel, drop_author=True, silent=silent
+                    )
                 break
             except FloodWaitError as error:
                 info(f"Flood wait {error.seconds}s...", f"Telegram {error.seconds}sn bekletiyor...", Fore.YELLOW)
@@ -732,15 +751,16 @@ async def load_topics(client, channel):
 
 
 async def pick_topic(client, channel):
-    """List the forum's topics and return the chosen topic ID (None = whole chat)."""
+    """List the forum's topics and return (topic_id, topic_title); (None, None)
+    means the whole chat."""
     info("Loading topics...", "Alt basliklar yukleniyor...")
     try:
         topics = await load_topics(client, channel)
     except RPCError as error:
         info(f"Could not load topics: {error}", "Alt basliklar yuklenemedi, tum sohbet kullanilacak.", Fore.RED)
-        return None
+        return None, None
     if not topics:
-        return None
+        return None, None
 
     print(f"\n{Fore.CYAN}Topics / Alt basliklar ({len(topics)}):{Style.RESET_ALL}")
     print("  0. Whole chat (Tum sohbet)")
@@ -751,17 +771,82 @@ async def pick_topic(client, channel):
         if raw.isdigit() and 0 <= int(raw) <= len(topics):
             break
     if raw == "0":
-        return None
+        return None, None
     topic = topics[int(raw) - 1]
     info(f"Selected topic: {topic.title} (ID {topic.id})", "Alt baslik secildi", Fore.GREEN)
-    return topic.id
+    return topic.id, topic.title
+
+
+async def resolve_target_topic(client, target, topic_title):
+    """Mirror the source topic on the target: if the source item came from a
+    named topic and the target is itself a forum, reuse a same-titled topic
+    there or create one automatically, no questions asked.
+
+    If the source had NO topic (private chat, or a plain group/channel) but
+    the target IS a forum, ask whether to create a new topic there instead of
+    just dropping everything into General.
+
+    Returns None when the target isn't a forum at all - in which case the
+    item is sent straight into the chat with no topic."""
+    if not getattr(target, "forum", False):
+        return None
+
+    if not topic_title:
+        if not ask_yes_no(
+            "Target is a forum group but the source has no topic. Create a new topic for this content?",
+            "Hedef forum grubu ama kaynakta alt baslik yok. Bu icerik icin hedefte yeni bir alt baslik olusturulsun mu? (Hayir = Genel'e gonderilir)",
+        ):
+            return None
+        while True:
+            topic_title = input(f"{Fore.CYAN}New topic title (Yeni alt baslik adi): {Style.RESET_ALL}").strip()
+            if topic_title:
+                break
+
+    try:
+        topics = await load_topics(client, target)
+    except RPCError as error:
+        info(
+            f"Could not load target topics, sending to General instead: {error}",
+            "Hedefteki alt basliklar yuklenemedi, Genel'e gonderilecek.",
+            Fore.RED,
+        )
+        return None
+    for topic in topics:
+        if topic.title == topic_title:
+            info(
+                f"Using matching target topic: {topic.title} (ID {topic.id})",
+                "Hedefte ayni isimli alt baslik bulundu, oraya gonderilecek",
+                Fore.GREEN,
+            )
+            return topic.id
+
+    info(
+        f"Creating target topic '{topic_title}'",
+        "Hedefte alt baslik olusturuluyor",
+        Fore.CYAN,
+    )
+    result = await client(
+        functions.messages.CreateForumTopicRequest(peer=target, title=topic_title)
+    )
+    for update in result.updates:
+        if isinstance(update, types.UpdateNewChannelMessage) and isinstance(
+            update.message.action, types.MessageActionTopicCreate
+        ):
+            info(f"Target topic created (ID {update.message.id})", "Hedef alt basligi olusturuldu", Fore.GREEN)
+            return update.message.id
+    raise OrderStop(
+        "Target topic was created but its ID could not be determined. "
+        "(Hedefte alt baslik olusturuldu ama ID'si tespit edilemedi.)"
+    )
 
 
 async def prepare_source(client, message_cache):
     channel = await ask_chat(
         client, "Source channel/group (link, @username, ID or name)", "Kaynak kanal/grup"
     )
-    topic_id = await pick_topic(client, channel) if getattr(channel, "forum", False) else None
+    topic_id, topic_title = (
+        await pick_topic(client, channel) if getattr(channel, "forum", False) else (None, None)
+    )
 
     title = safe_filename(getattr(channel, "title", "chat"))[:60]
     base_name = f"{title}_{abs(channel.id)}" + (f"_t{topic_id}" if topic_id else "")
@@ -804,6 +889,7 @@ async def prepare_source(client, message_cache):
             "version": 1,
             "source": {"id": channel.id, "title": getattr(channel, "title", "")},
             "topic_id": topic_id,
+            "topic_title": topic_title,
             # iter_messages bounds are exclusive, the user's are inclusive.
             "min_id": max(min_id - 1, 0) if min_id else 0,
             "max_id": max_id + 1 if max_id else 0,
@@ -847,6 +933,7 @@ def pick_existing_folder():
 
 async def ask_target_and_options(client, manifest):
     target = await ask_chat(client, "Target channel to post into", "Gonderilecek hedef kanal")
+    target_topic_id = await resolve_target_topic(client, target, manifest.get("topic_title"))
     progress = manifest.get("sent", {}).get(str(target.id))
     if progress and progress["last_n"]:
         if not ask_yes_no(
@@ -858,7 +945,7 @@ async def ask_target_and_options(client, manifest):
         "Post silently (no notification for each message)?",
         "Sessiz gonderilsin mi (her mesaj icin bildirim gitmesin)?",
     )
-    return target, silent
+    return target, silent, target_topic_id
 
 
 async def main():
@@ -885,8 +972,8 @@ async def main():
                 if not folder:
                     return
                 manifest = load_manifest(folder)
-                target, silent = await ask_target_and_options(client, manifest)
-                await send_all(client, target, folder, manifest, silent)
+                target, silent, target_topic_id = await ask_target_and_options(client, manifest)
+                await send_all(client, target, folder, manifest, silent, topic_id=target_topic_id)
                 return
 
             channel, folder, manifest = await prepare_source(client, message_cache)
@@ -899,8 +986,8 @@ async def main():
                         Fore.RED,
                     )
                     return
-                target, silent = await ask_target_and_options(client, manifest)
-                await forward_all(client, channel, target, folder, manifest, silent)
+                target, silent, target_topic_id = await ask_target_and_options(client, manifest)
+                await forward_all(client, channel, target, folder, manifest, silent, topic_id=target_topic_id)
                 return
 
             if mode == "1":
@@ -909,7 +996,7 @@ async def main():
 
             # Mode 3: every question is asked up front so the run can be
             # left unattended.
-            target, silent = await ask_target_and_options(client, manifest)
+            target, silent, target_topic_id = await ask_target_and_options(client, manifest)
             delete_after = ask_yes_no(
                 "Delete each file from this computer right after it is sent?",
                 "Her dosya gonderildikten hemen sonra bu bilgisayardan silinsin mi?",
@@ -924,7 +1011,7 @@ async def main():
                     "Bazi dosyalar inmedi. Yine de gonderilsin mi? Ilk eksik dosyada durur.",
                 ):
                     return
-                await send_all(client, target, folder, manifest, silent)
+                await send_all(client, target, folder, manifest, silent, topic_id=target_topic_id)
                 return
 
             # Download and send in small windows so disk usage stays at a
@@ -935,7 +1022,7 @@ async def main():
                 await download_all(client, channel, folder, manifest, message_cache, chunk)
                 await send_all(
                     client, target, folder, manifest, silent,
-                    upto_n=chunk[-1]["n"], delete_after=True,
+                    upto_n=chunk[-1]["n"], delete_after=True, topic_id=target_topic_id,
                 )
             info(
                 "All items sent in the original order; files deleted.",

@@ -10,18 +10,38 @@ a manifest.json that is the single source of truth for ordering; downloads
 may run in parallel (files are numbered), but sending is strictly
 sequential and stops on the first error instead of skipping, so the target
 channel can never end up out of order.
+
+Self-healing: transient failures (network drops, timeouts, server errors,
+stalled transfers) are retried in-process with backoff, the answers given at
+startup are saved to mirrors/run_state.json, and a small supervisor
+(auto_restart.py) starts the program again with those answers if the process
+itself dies. Run with --no-restart to disable the supervisor.
 """
+import os
+import sys
+
+# Must run before the heavy imports below: those read credentials and can
+# prompt, and the supervisor only needs the standard library.
+if __name__ == "__main__":
+    import auto_restart
+
+    if not auto_restart.is_child() and "--no-restart" not in sys.argv:
+        sys.exit(auto_restart.supervise(os.path.abspath(__file__), sys.argv[1:]))
+
 import asyncio
 import base64
+import contextlib
+import errno
 import json
-import os
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 from colorama import Fore, Style
 from tqdm.asyncio import tqdm
-from telethon import TelegramClient, functions
+from telethon import TelegramClient, functions, utils
+from telethon import errors as tg_errors
 from telethon.errors import (
     ChatAdminRequiredError,
     ChatForwardsRestrictedError,
@@ -62,6 +82,100 @@ ORDER_LIST_NAME = "SIRA.txt"
 # overall than repeatedly hitting multi-minute waits.
 SEND_DELAY = float(os.getenv("SEND_DELAY", "2"))
 FORWARD_CHUNK = 100  # Telegram's max message IDs per ForwardMessages call
+
+# --- self-healing settings (all overridable from .env) ---
+# Seconds a transfer may go without any progress before it is aborted and
+# retried; a silently hung connection otherwise freezes the program forever.
+STALL_TIMEOUT = float(os.getenv("STALL_TIMEOUT", "180"))
+# Hard limit for a single send/forward request (no progress callbacks there).
+REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "300"))
+# Non-network failures (a rejected message, a missing file...) that happen this
+# many times in a row WITHOUT any progress in between stop the run for good,
+# because skipping would break the order. Network failures never count: the
+# program waits for the connection as long as it takes.
+AUTO_RESTART_LIMIT = int(os.getenv("AUTO_RESTART_LIMIT", "15"))
+RETRY_DELAY_MAX = float(os.getenv("RETRY_DELAY_MAX", "120"))
+AUTO_MODE = "--auto" in sys.argv  # set by the supervisor on restarts
+STATE_NAME = "run_state.json"
+
+EXIT_DONE = 0
+EXIT_CRASH = 1        # supervisor restarts the program
+EXIT_NEEDS_HUMAN = 2  # supervisor does NOT restart
+
+# Errors where retrying cannot help: the account/session or the chats
+# themselves are the problem.
+FATAL_ERRORS = tuple(
+    getattr(tg_errors, name)
+    for name in (
+        "AuthKeyUnregisteredError", "AuthKeyDuplicatedError", "UserDeactivatedError",
+        "UserDeactivatedBanError", "SessionRevokedError", "SessionExpiredError",
+        "PhoneNumberBannedError", "SessionPasswordNeededError", "ChannelPrivateError",
+        "ChannelInvalidError", "ChatForwardsRestrictedError", "UserBannedInChannelError",
+        "ChatRestrictedError",
+    )
+    if hasattr(tg_errors, name)
+)
+NETWORK_ERRORS = tuple(
+    [ConnectionError, TimeoutError, asyncio.TimeoutError, EOFError, asyncio.IncompleteReadError]
+    + [getattr(tg_errors, n) for n in ("ServerError", "TimedOutError", "InvalidBufferError") if hasattr(tg_errors, n)]
+)
+LOCAL_FILE_ERRORS = (PermissionError, FileNotFoundError, FileExistsError, IsADirectoryError, NotADirectoryError)
+
+
+def is_network_error(error: BaseException) -> bool:
+    """True for connection-type failures, which are waited out indefinitely."""
+    if isinstance(error, NETWORK_ERRORS):
+        return True
+    # Sockets/SSL/DNS errors are plain OSErrors; local file problems are not.
+    return isinstance(error, OSError) and not isinstance(error, LOCAL_FILE_ERRORS) \
+        and error.errno != errno.ENOSPC
+
+_progress = [0]
+
+
+def tick():
+    """Record that real work got done (a file downloaded, an item sent...).
+    The recovery loop uses it to tell 'flaky connection' from 'stuck for good'."""
+    _progress[0] += 1
+
+
+class StallError(TimeoutError):
+    """No progress for STALL_TIMEOUT seconds."""
+
+
+class Activity:
+    def __init__(self):
+        self.last = time.monotonic()
+
+    def touch(self):
+        self.last = time.monotonic()
+
+
+async def stall_guard(awaitable, activity: Activity, what: str):
+    """Await `awaitable`, but abort it if `activity` shows no progress for
+    STALL_TIMEOUT seconds (the progress callback keeps touching it)."""
+    task = asyncio.ensure_future(awaitable)
+    activity.touch()
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=5)
+            if done:
+                return task.result()
+            if time.monotonic() - activity.last > STALL_TIMEOUT:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
+                raise StallError(f"{what}: no progress for {STALL_TIMEOUT:.0f}s")
+    except asyncio.CancelledError:
+        task.cancel()
+        raise
+
+
+async def with_timeout(awaitable, what: str):
+    try:
+        return await asyncio.wait_for(awaitable, REQUEST_TIMEOUT)
+    except asyncio.TimeoutError:
+        raise StallError(f"{what}: no answer from Telegram for {REQUEST_TIMEOUT:.0f}s") from None
 
 # Attributes that reference other server objects (sticker sets, custom emoji)
 # can't be recreated by re-uploading, so they're dropped on send.
@@ -240,7 +354,7 @@ def build_part(message, n: int, index_in_album):
     return part
 
 
-async def scan_chat(client, channel, manifest, message_cache):
+async def scan_chat(client, channel, manifest, message_cache, folder=None):
     """Append every message newer than the last scanned one, in order.
 
     Consecutive messages sharing a grouped_id form one album item, exactly
@@ -290,6 +404,11 @@ async def scan_chat(client, channel, manifest, message_cache):
         added += 1
         if added % 500 == 0:
             print(f"  {added} messages scanned... ({added} mesaj tarandi...)")
+            if folder:
+                # A dropped connection halfway through a huge chat resumes
+                # from here instead of rescanning everything.
+                save_manifest(folder, manifest)
+                tick()
 
     info(f"{added} new message(s) scanned.", f"{added} yeni mesaj tarandi.", Fore.GREEN)
     return added
@@ -323,7 +442,12 @@ async def download_part(client, channel, message, part, folder, semaphore):
             ncols=100,
             leave=False,
         )
-        callback = lambda current, total: bar.update(current - bar.n)
+        activity = Activity()
+
+        def callback(current, total):
+            activity.touch()
+            bar.update(current - bar.n)
+
         last_error = None
 
         for attempt in range(1, MAX_RETRY + 2):
@@ -336,16 +460,22 @@ async def download_part(client, channel, message, part, folder, semaphore):
                 )
                 if use_fast:
                     with open(tmp, "wb") as out:
-                        await fast_parallel_download(
-                            client,
-                            message.document,
-                            out,
-                            progress_callback=callback,
-                            connection_count=FAST_DOWNLOAD_MAX_CONNECTIONS,
+                        await stall_guard(
+                            fast_parallel_download(
+                                client,
+                                message.document,
+                                out,
+                                progress_callback=callback,
+                                connection_count=FAST_DOWNLOAD_MAX_CONNECTIONS,
+                            ),
+                            activity,
+                            f"download {file_info['name']}",
                         )
                 else:
-                    result = await client.download_media(
-                        message, file=str(tmp), progress_callback=callback
+                    result = await stall_guard(
+                        client.download_media(message, file=str(tmp), progress_callback=callback),
+                        activity,
+                        f"download {file_info['name']}",
                     )
                     if not result:
                         raise RuntimeError("Telegram returned no file")
@@ -367,6 +497,13 @@ async def download_part(client, channel, message, part, folder, semaphore):
                 last_error = error
                 await asyncio.sleep(error.seconds + 1)
             except (RPCError, RuntimeError, OSError, ConnectionError) as error:
+                if isinstance(error, OSError) and error.errno == errno.ENOSPC:
+                    bar.close()
+                    tmp.unlink(missing_ok=True)
+                    raise OrderStop(
+                        "Disk is full. Free some space and run again. (Disk dolu, yer acip tekrar calistirin.)",
+                        fatal=True,
+                    )
                 last_error = error
                 await asyncio.sleep(2 * attempt)
         else:
@@ -386,6 +523,7 @@ async def download_part(client, channel, message, part, folder, semaphore):
             except (RPCError, OSError, TypeError, ValueError):
                 file_info["thumb"] = None  # optional; Telegram generates one if missing
 
+        tick()
         print(f"{Fore.GREEN}OK{Style.RESET_ALL} {file_info['name']}")
         return True
 
@@ -425,6 +563,9 @@ async def download_all(client, channel, folder: Path, manifest, message_cache, i
     results = await asyncio.gather(*tasks, return_exceptions=True)
     save_manifest(folder, manifest)  # thumbs may have been cleared
     for result in results:
+        if isinstance(result, OrderStop) and result.fatal:
+            raise result
+    for result in results:
         if isinstance(result, BaseException):
             print(f"{Fore.RED}Unexpected download error: {result}{Style.RESET_ALL}")
     failed += sum(1 for result in results if result is not True)
@@ -443,18 +584,44 @@ async def download_all(client, channel, folder: Path, manifest, message_cache, i
 # Re-upload to the target channel, strictly in order
 # ---------------------------------------------------------------------------
 class OrderStop(Exception):
-    """Raised to halt sending; skipping an item would break the order."""
+    """Raised to halt sending; skipping an item would break the order.
+
+    fatal=True means retrying cannot help (no permission, protected source...)
+    so the recovery loop stops instead of trying again."""
+
+    def __init__(self, message, fatal=False):
+        super().__init__(message)
+        self.fatal = fatal
+
+
+async def tg_send_file(client, *args, **kwargs):
+    return await with_timeout(client.send_file(*args, **kwargs), "send file")
+
+
+async def tg_send_message(client, *args, **kwargs):
+    return await with_timeout(client.send_message(*args, **kwargs), "send message")
 
 
 async def upload_path(client, path: Path, desc: str):
     size = path.stat().st_size
     bar = tqdm(total=size, desc=desc[:40], unit="B", unit_scale=True, ncols=100, leave=False)
-    callback = lambda current, total: bar.update(current - bar.n)
+    activity = Activity()
+
+    def callback(current, total):
+        activity.touch()
+        bar.update(current - bar.n)
+
     try:
         if USE_FAST_DOWNLOAD and size >= FAST_DOWNLOAD_MIN_MB * 1024 * 1024:
             with open(path, "rb") as handle:
-                return await fast_parallel_upload(client, handle, progress_callback=callback)
-        return await client.upload_file(str(path), progress_callback=callback)
+                return await stall_guard(
+                    fast_parallel_upload(client, handle, progress_callback=callback),
+                    activity,
+                    f"upload {desc}",
+                )
+        return await stall_guard(
+            client.upload_file(str(path), progress_callback=callback), activity, f"upload {desc}"
+        )
     finally:
         bar.close()
 
@@ -462,7 +629,7 @@ async def upload_path(client, path: Path, desc: str):
 async def build_media(client, folder: Path, file_info):
     path = folder / file_info["name"]
     if not file_is_complete(folder, file_info):
-        raise OrderStop(
+        raise MissingFileStop(
             f"File missing or incomplete: {file_info['name']} - run the download step first. "
             f"(Dosya eksik: once indirme adimini calistirin.)"
         )
@@ -472,7 +639,7 @@ async def build_media(client, folder: Path, file_info):
 
     thumb = None
     if file_info.get("thumb") and (folder / file_info["thumb"]).exists():
-        thumb = await client.upload_file(str(folder / file_info["thumb"]))
+        thumb = await with_timeout(client.upload_file(str(folder / file_info["thumb"])), "upload thumbnail")
 
     return types.InputMediaUploadedDocument(
         file=uploaded,
@@ -493,7 +660,7 @@ async def send_item(client, target, folder: Path, item, silent: bool, medias, to
     if not media_parts:
         if not texts[0].strip():
             return
-        await client.send_message(
+        await tg_send_message(client,
             target,
             texts[0],
             formatting_entities=entities[0] or None,
@@ -510,7 +677,7 @@ async def send_item(client, target, folder: Path, item, silent: bool, medias, to
 
     try:
         if len(medias) == 1:
-            await client.send_file(
+            await tg_send_file(client,
                 target,
                 medias[0],
                 caption=texts[0],
@@ -520,7 +687,7 @@ async def send_item(client, target, folder: Path, item, silent: bool, medias, to
                 reply_to=topic_id,
             )
         else:
-            await client.send_file(
+            await tg_send_file(client,
                 target,
                 medias,
                 caption=texts,
@@ -534,15 +701,19 @@ async def send_item(client, target, folder: Path, item, silent: bool, medias, to
         # limit than ours: post the media bare, then the text right after it.
         # Re-upload, since the failed request may have consumed the file parts.
         medias[:] = [await build_media(client, folder, p["file"]) for p in media_parts]
-        await client.send_file(
+        await tg_send_file(client,
             target, medias if len(medias) > 1 else medias[0], silent=silent, reply_to=topic_id,
         )
         for text, ents in zip(texts, entities):
             if text.strip():
-                await client.send_message(
+                await tg_send_message(client,
                     target, text, formatting_entities=ents or None, parse_mode=None,
                     link_preview=False, silent=silent, reply_to=topic_id,
                 )
+
+
+class MissingFileStop(OrderStop):
+    """A file to send isn't on disk (yet)."""
 
 
 def delete_item_files(folder: Path, item):
@@ -585,8 +756,11 @@ async def send_all(client, target, folder: Path, manifest, silent: bool, upto_n=
                 except (ChatWriteForbiddenError, ChatAdminRequiredError) as error:
                     raise OrderStop(
                         f"No permission to post in the target: {error} "
-                        f"(Hedef kanalda paylasim yetkiniz yok; yonetici olup mesaj gonderme izni gerekir.)"
+                        f"(Hedef kanalda paylasim yetkiniz yok; yonetici olup mesaj gonderme izni gerekir.)",
+                        fatal=True,
                     )
+                except FATAL_ERRORS as error:
+                    raise OrderStop(f"Cannot continue: {error!r}", fatal=True)
                 except (RPCError, OSError, ConnectionError) as error:
                     attempt += 1
                     medias.clear()  # uploaded parts may have been discarded server-side
@@ -603,6 +777,7 @@ async def send_all(client, target, folder: Path, manifest, silent: bool, upto_n=
 
         progress["last_n"] = item["n"]
         save_manifest(folder, manifest)
+        tick()
         # Only after progress is saved: a crash in between leaves the file
         # on disk rather than losing an unsent one.
         if delete_after:
@@ -629,19 +804,25 @@ async def forward_all(client, channel, target, folder: Path, manifest, silent: b
                 if topic_id:
                     # The high-level forward_messages() has no way to target a
                     # specific topic, so the raw request is used directly.
-                    await client(
-                        functions.messages.ForwardMessagesRequest(
-                            from_peer=channel,
-                            id=ids,
-                            to_peer=target,
-                            drop_author=True,
-                            silent=silent,
-                            top_msg_id=topic_id,
-                        )
+                    await with_timeout(
+                        client(
+                            functions.messages.ForwardMessagesRequest(
+                                from_peer=channel,
+                                id=ids,
+                                to_peer=target,
+                                drop_author=True,
+                                silent=silent,
+                                top_msg_id=topic_id,
+                            )
+                        ),
+                        "forward",
                     )
                 else:
-                    await client.forward_messages(
-                        target, ids, from_peer=channel, drop_author=True, silent=silent
+                    await with_timeout(
+                        client.forward_messages(
+                            target, ids, from_peer=channel, drop_author=True, silent=silent
+                        ),
+                        "forward",
                     )
                 break
             except FloodWaitError as error:
@@ -649,6 +830,7 @@ async def forward_all(client, channel, target, folder: Path, manifest, silent: b
                 await asyncio.sleep(error.seconds + 1)
         progress["last_n"] = chunk_items[-1]["n"]
         save_manifest(folder, manifest)
+        tick()
         print(f"{Fore.GREEN}COPIED{Style.RESET_ALL} up to #{progress['last_n']:05d}")
         chunk_items.clear()
         await asyncio.sleep(SEND_DELAY)
@@ -665,10 +847,15 @@ async def forward_all(client, channel, target, folder: Path, manifest, silent: b
         raise OrderStop(
             "Source chat has content protection; direct copy is blocked. Use mode 3 "
             "(download + re-upload) instead. (Kaynak kanal korumali; 3 numarali "
-            "'indir + gonder' modunu kullanin.)"
+            "'indir + gonder' modunu kullanin.)",
+            fatal=True,
         )
     except (ChatWriteForbiddenError, ChatAdminRequiredError) as error:
-        raise OrderStop(f"No permission to post in the target: {error} (Hedef kanalda yetkiniz yok.)")
+        raise OrderStop(
+            f"No permission to post in the target: {error} (Hedef kanalda yetkiniz yok.)", fatal=True
+        )
+    except FATAL_ERRORS as error:
+        raise OrderStop(f"Cannot continue: {error!r}", fatal=True)
     except (RPCError, OSError, ConnectionError) as error:
         raise OrderStop(f"Copy failed after #{progress['last_n']:05d}: {error}")
 
@@ -840,7 +1027,10 @@ async def resolve_target_topic(client, target, topic_title):
     )
 
 
-async def prepare_source(client, message_cache):
+async def choose_source(client):
+    """Interactive: pick the source chat/topic/range and create (or continue)
+    its mirror folder. Nothing is scanned here; execute_plan does that, so a
+    restart goes through exactly the same code path."""
     channel = await ask_chat(
         client, "Source channel/group (link, @username, ID or name)", "Kaynak kanal/grup"
     )
@@ -868,9 +1058,7 @@ async def prepare_source(client, message_cache):
             folder = candidate
             break
 
-    if folder:
-        manifest = load_manifest(folder)
-    else:
+    if not folder:
         info(
             "Optional range: paste a message link or ID; leave empty for the whole chat.",
             "Istege bagli aralik: mesaj linki veya ID yapistirin; bos = tum sohbet.",
@@ -897,8 +1085,13 @@ async def prepare_source(client, message_cache):
             "items": [],
             "sent": {},
         }
+        save_manifest(folder, manifest)
 
-    await scan_chat(client, channel, manifest, message_cache)
+    return channel, folder
+
+
+async def scan_and_report(client, channel, folder: Path, manifest, message_cache):
+    await scan_chat(client, channel, manifest, message_cache, folder)
     save_manifest(folder, manifest)
     write_order_list(folder, manifest)
 
@@ -911,7 +1104,6 @@ async def prepare_source(client, message_cache):
         f"Sira listesi: {ORDER_LIST_NAME}",
         Fore.GREEN,
     )
-    return channel, folder, manifest
 
 
 def pick_existing_folder():
@@ -948,7 +1140,190 @@ async def ask_target_and_options(client, manifest):
     return target, silent, target_topic_id
 
 
-async def main():
+# ---------------------------------------------------------------------------
+# Saved run state, execution and automatic recovery
+# ---------------------------------------------------------------------------
+def save_state(plan):
+    path = MIRRORS_DIR / STATE_NAME
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(plan, ensure_ascii=False, indent=1), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def load_state():
+    try:
+        return json.loads((MIRRORS_DIR / STATE_NAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def keep_system_awake():
+    """Windows suspends the PC (and with it the connection) after a while;
+    ask it not to for as long as this program runs. The screen may still turn off."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            ctypes.windll.kernel32.SetThreadExecutionState(0x80000000 | 0x00000001)
+        except Exception:
+            pass
+
+
+async def resolve_peer(client, peer_id, label: str):
+    """Find a chat again from the ID saved in the run state."""
+    try:
+        return await client.get_entity(peer_id)
+    except ValueError:
+        pass
+    await client.get_dialogs()  # refresh the entity cache, then try once more
+    try:
+        return await client.get_entity(peer_id)
+    except ValueError:
+        raise OrderStop(
+            f"{label} chat {peer_id} was not found anymore (left the chat or it was deleted). "
+            f"({label} sohbet artik bulunamiyor.)",
+            fatal=True,
+        )
+
+
+async def ensure_connected(client):
+    if not client.is_connected():
+        await client.connect()  # connection_retries=-1: waits until the network is back
+    if not await client.is_user_authorized():
+        raise OrderStop(
+            "Telegram login is missing or was revoked. Delete the .session file and run the program "
+            "once by hand to log in again. (Telegram oturumu gecersiz; .session dosyasini silip "
+            "programi bir kez elle calistirarak tekrar giris yapin.)",
+            fatal=True,
+        )
+
+
+async def execute_plan(client, plan, message_cache):
+    """Run the saved plan from wherever it currently stands. Everything here
+    is resumable, so the recovery loop simply calls it again after a failure."""
+    mode = plan["mode"]
+    folder = MIRRORS_DIR / plan["folder"]
+    manifest = load_manifest(folder)  # fresh from disk: it is the source of truth
+    if manifest is None:
+        raise OrderStop(f"{folder / MANIFEST_NAME} is missing. (manifest.json bulunamadi.)", fatal=True)
+
+    channel = None
+    if mode != "2":
+        channel = await resolve_peer(client, plan["source_peer"], "Source")
+        await scan_and_report(client, channel, folder, manifest, message_cache)
+
+    if mode == "1":
+        failed = await download_all(client, channel, folder, manifest, message_cache)
+        if failed:
+            raise OrderStop(f"{failed} file(s) could not be downloaded")
+        return
+
+    target = await resolve_peer(client, plan["target_peer"], "Target")
+    topic_id = plan.get("target_topic_id")
+    silent = plan.get("silent", False)
+
+    if mode == "4":
+        await forward_all(client, channel, target, folder, manifest, silent, topic_id=topic_id)
+    elif mode == "2":
+        try:
+            await send_all(client, target, folder, manifest, silent, topic_id=topic_id)
+        except MissingFileStop as stop:
+            # Send-only mode never downloads, so retrying can't fix this.
+            raise OrderStop(str(stop), fatal=True)
+    else:  # mode 3: download + send
+        progress = manifest.get("sent", {}).get(str(target.id), {})
+        todo = [i for i in manifest["items"] if i["n"] > progress.get("last_n", 0)]
+
+        if not plan.get("delete_after"):
+            # Failed downloads don't block sending: send_all stops at the first
+            # missing file and the next round retries just those downloads.
+            await download_all(client, channel, folder, manifest, message_cache, todo)
+            await send_all(client, target, folder, manifest, silent, topic_id=topic_id)
+        else:
+            # Download and send in small windows so disk usage stays at a
+            # few files instead of the whole chat.
+            window = max(1, batch_size) * 2
+            for start in range(0, len(todo), window):
+                chunk = todo[start:start + window]
+                await download_all(client, channel, folder, manifest, message_cache, chunk)
+                await send_all(
+                    client, target, folder, manifest, silent,
+                    upto_n=chunk[-1]["n"], delete_after=True, topic_id=topic_id,
+                )
+            info(
+                "All items sent in the original order; files deleted.",
+                "Tum ogeler sirayla gonderildi, dosyalar silindi.",
+                Fore.GREEN,
+            )
+    return
+
+
+def report_stop(stop_text: str, resumable=True):
+    print(f"\n{Fore.RED}STOPPED: {stop_text}{Style.RESET_ALL}")
+    if resumable:
+        info(
+            "Progress is saved; start the program again to resume from this exact item.",
+            "Ilerleme kaydedildi; programi tekrar calistirinca tam bu ogeden devam eder.",
+            Fore.YELLOW,
+        )
+
+
+async def run_plan(client, plan) -> int:
+    """Run the plan, retrying with backoff until it finishes or hits something
+    only a human can fix. Returns the process exit code."""
+    message_cache = {}
+    failures = 0          # consecutive failed rounds without progress in between
+    hard_failures = 0     # same, but only counting non-network failures
+    seen_progress = _progress[0]
+
+    while True:
+        try:
+            await ensure_connected(client)
+            await execute_plan(client, plan, message_cache)
+            return EXIT_DONE
+        except OrderStop as stop:
+            if stop.fatal:
+                report_stop(str(stop))
+                return EXIT_NEEDS_HUMAN
+            last_error, network = stop, False
+        except FATAL_ERRORS as fatal:
+            report_stop(f"{fatal!r}")
+            return EXIT_NEEDS_HUMAN
+        except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
+            raise
+        except Exception as caught:
+            if isinstance(caught, OSError) and caught.errno == errno.ENOSPC:
+                report_stop("Disk is full. Free some space and start again. (Disk dolu.)")
+                return EXIT_NEEDS_HUMAN
+            # (`except ... as name` unbinds the name afterwards, hence the copy)
+            last_error, network = caught, is_network_error(caught)
+
+        if _progress[0] != seen_progress:  # something got done since the last failure
+            seen_progress = _progress[0]
+            failures = hard_failures = 0
+        failures += 1
+        if not network:
+            hard_failures += 1
+            if hard_failures > AUTO_RESTART_LIMIT:
+                report_stop(
+                    f"Same problem {hard_failures} times in a row with no progress: {last_error!r}"
+                )
+                return EXIT_NEEDS_HUMAN
+
+        delay = min(3 * 2 ** min(failures - 1, 6), RETRY_DELAY_MAX)
+        kind = "connection problem" if network else "error"
+        print(
+            f"\n{Fore.YELLOW}{kind}: {last_error!r}{Style.RESET_ALL}\n"
+            f"Retrying automatically in {delay:.0f}s, resuming where it stopped "
+            f"(attempt {failures}). ({delay:.0f} sn sonra otomatik olarak kaldigi yerden devam edilecek.)"
+        )
+        message_cache.clear()  # file references in cached messages may be stale by now
+        await asyncio.sleep(delay)
+
+
+async def interactive_setup(client):
+    """Ask everything once, up front, and return the plan (or None). The plan is
+    saved to run_state.json so a restart never has to ask again."""
     print(
         f"\n{Fore.CYAN}=== Ordered Mirror / Sirali Kanal Aktarimi ==={Style.RESET_ALL}\n"
         "1. Download in order (videos + files + texts)   / Sirali indir\n"
@@ -960,83 +1335,91 @@ async def main():
     mode = input(f"{Fore.CYAN}Choice (1-4): {Style.RESET_ALL}").strip()
     if mode not in ("1", "2", "3", "4"):
         info("Invalid choice.", "Gecersiz secim.", Fore.RED)
-        return
+        return None
 
+    if mode == "2":
+        folder = pick_existing_folder()
+        if not folder:
+            return None
+        channel = None
+    else:
+        channel, folder = await choose_source(client)
+        if mode == "4" and getattr(channel, "noforwards", False):
+            info(
+                "This chat has content protection; direct copy will fail. Use mode 3.",
+                "Bu kanal korumali; dogrudan kopyalama calismaz, 3. modu kullanin.",
+                Fore.RED,
+            )
+            return None
+
+    plan = {
+        "mode": mode,
+        "folder": folder.name,
+        "source_peer": utils.get_peer_id(channel) if channel is not None else None,
+        "created": datetime.now(timezone.utc).isoformat(),
+        "finished": False,
+    }
+    if mode == "1":
+        return plan
+
+    # Every remaining question is asked up front so the run can be left unattended.
+    manifest = load_manifest(folder)
+    target, silent, target_topic_id = await ask_target_and_options(client, manifest)
+    save_manifest(folder, manifest)  # "start over" answer resets the saved position
+    plan.update(
+        target_peer=utils.get_peer_id(target),
+        target_topic_id=target_topic_id,
+        silent=silent,
+        delete_after=ask_yes_no(
+            "Delete each file from this computer right after it is sent?",
+            "Her dosya gonderildikten hemen sonra bu bilgisayardan silinsin mi?",
+        ) if mode == "3" else False,
+    )
+    return plan
+
+
+async def main() -> int:
+    keep_system_awake()
     MIRRORS_DIR.mkdir(parents=True, exist_ok=True)
-    message_cache = {}
 
-    async with TelegramClient(str(BASE_DIR / session_name), api_id, api_hash) as client:
+    plan = None
+    state = load_state()
+    if state and not state.get("finished"):
+        if AUTO_MODE or ask_yes_no(
+            f"An earlier run (mode {state.get('mode')}, '{state.get('folder')}') did not finish. "
+            f"Resume it where it stopped?",
+            "Onceki islem tamamlanmamis. Kaldigi yerden devam edilsin mi? (Hayir = yeni islem)",
+        ):
+            plan = state
+
+    # connection_retries=-1 / auto_reconnect: Telethon itself keeps trying to
+    # reconnect forever instead of giving up after 5 attempts.
+    async with TelegramClient(
+        str(BASE_DIR / session_name), api_id, api_hash,
+        connection_retries=-1, retry_delay=3, request_retries=8, auto_reconnect=True,
+    ) as client:
         try:
-            if mode == "2":
-                folder = pick_existing_folder()
-                if not folder:
-                    return
-                manifest = load_manifest(folder)
-                target, silent, target_topic_id = await ask_target_and_options(client, manifest)
-                await send_all(client, target, folder, manifest, silent, topic_id=target_topic_id)
-                return
+            if plan is None:
+                plan = await interactive_setup(client)
+                if plan is None:
+                    return EXIT_NEEDS_HUMAN  # nothing to run; don't let the supervisor restart
+                save_state(plan)
+            code = await run_plan(client, plan)
+        except OrderStop as stop:  # raised while asking (e.g. creating the target topic)
+            report_stop(str(stop), resumable=False)
+            return EXIT_NEEDS_HUMAN
 
-            channel, folder, manifest = await prepare_source(client, message_cache)
-
-            if mode == "4":
-                if getattr(channel, "noforwards", False):
-                    info(
-                        "This chat has content protection; direct copy will fail. Use mode 3.",
-                        "Bu kanal korumali; dogrudan kopyalama calismaz, 3. modu kullanin.",
-                        Fore.RED,
-                    )
-                    return
-                target, silent, target_topic_id = await ask_target_and_options(client, manifest)
-                await forward_all(client, channel, target, folder, manifest, silent, topic_id=target_topic_id)
-                return
-
-            if mode == "1":
-                await download_all(client, channel, folder, manifest, message_cache)
-                return
-
-            # Mode 3: every question is asked up front so the run can be
-            # left unattended.
-            target, silent, target_topic_id = await ask_target_and_options(client, manifest)
-            delete_after = ask_yes_no(
-                "Delete each file from this computer right after it is sent?",
-                "Her dosya gonderildikten hemen sonra bu bilgisayardan silinsin mi?",
-            )
-            progress = manifest.get("sent", {}).get(str(target.id), {})
-            todo = [i for i in manifest["items"] if i["n"] > progress.get("last_n", 0)]
-
-            if not delete_after:
-                failed = await download_all(client, channel, folder, manifest, message_cache, todo)
-                if failed and not ask_yes_no(
-                    "Some files failed. Send anyway? Sending will stop at the first missing file.",
-                    "Bazi dosyalar inmedi. Yine de gonderilsin mi? Ilk eksik dosyada durur.",
-                ):
-                    return
-                await send_all(client, target, folder, manifest, silent, topic_id=target_topic_id)
-                return
-
-            # Download and send in small windows so disk usage stays at a
-            # few files instead of the whole chat.
-            window = max(1, batch_size) * 2
-            for start in range(0, len(todo), window):
-                chunk = todo[start:start + window]
-                await download_all(client, channel, folder, manifest, message_cache, chunk)
-                await send_all(
-                    client, target, folder, manifest, silent,
-                    upto_n=chunk[-1]["n"], delete_after=True, topic_id=target_topic_id,
-                )
-            info(
-                "All items sent in the original order; files deleted.",
-                "Tum ogeler sirayla gonderildi, dosyalar silindi.",
-                Fore.GREEN,
-            )
-        except OrderStop as stop:
-            print(f"\n{Fore.RED}STOPPED: {stop}{Style.RESET_ALL}")
-            info(
-                "Progress is saved; run again to resume from this exact item.",
-                "Ilerleme kaydedildi; tekrar calistirinca tam bu ogeden devam eder.",
-                Fore.YELLOW,
-            )
+    if code == EXIT_DONE:
+        plan["finished"] = True
+        save_state(plan)
+        info("Done.", "Tamamlandi.", Fore.GREEN)
+    return code
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        exit_code = asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nStopped by user; progress is saved. (Kullanici durdurdu; ilerleme kaydedildi.)")
+        exit_code = EXIT_NEEDS_HUMAN
+    sys.exit(exit_code)

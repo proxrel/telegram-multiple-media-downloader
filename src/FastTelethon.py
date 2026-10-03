@@ -57,7 +57,7 @@ class DownloadSender:
         self.request.offset += self.stride
         return result.bytes
 
-    def disconnect(self) -> Awaitable[None]:
+    def disconnect(self, abort: bool = False) -> Awaitable[None]:
         return self.sender.disconnect()
 
 
@@ -96,10 +96,16 @@ class UploadSender:
         await self.client._call(self.sender, self.request)
         self.request.file_part += self.stride
 
-    async def disconnect(self) -> None:
-        if self.previous:
-            await self.previous
-        return await self.sender.disconnect()
+    async def disconnect(self, abort: bool = False) -> None:
+        try:
+            if self.previous:
+                if abort:
+                    self.previous.cancel()
+                    await asyncio.gather(self.previous, return_exceptions=True)
+                else:
+                    await self.previous
+        finally:
+            await self.sender.disconnect()
 
 
 class ParallelTransferrer:
@@ -119,9 +125,14 @@ class ParallelTransferrer:
         self.senders = None
         self.upload_ticker = 0
 
-    async def _cleanup(self) -> None:
-        await asyncio.gather(*[sender.disconnect() for sender in self.senders])
-        self.senders = None
+    async def _cleanup(self, abort: bool = False) -> None:
+        # Safe to call more than once and after a failed transfer; without
+        # this every failed/cancelled attempt leaked its extra connections.
+        senders, self.senders = self.senders, None
+        if not senders:
+            return
+        await asyncio.gather(*[sender.disconnect(abort) for sender in senders],
+                             return_exceptions=True)
 
     @staticmethod
     def _get_connection_count(file_size: int, max_count: int = 20,
@@ -225,23 +236,30 @@ class ParallelTransferrer:
         part_count = math.ceil(file_size / part_size)
         log.debug("Starting parallel download: "
                   f"{connection_count} {part_size} {part_count} {file!s}")
-        await self._init_download(connection_count, file, part_count, part_size)
+        tasks = []
+        try:
+            await self._init_download(connection_count, file, part_count, part_size)
 
-        part = 0
-        while part < part_count:
-            tasks = []
-            for sender in self.senders:
-                tasks.append(self.loop.create_task(sender.next()))
+            part = 0
+            while part < part_count:
+                tasks = []
+                for sender in self.senders:
+                    tasks.append(self.loop.create_task(sender.next()))
+                for task in tasks:
+                    data = await task
+                    if not data:
+                        break
+                    yield data
+                    part += 1
+                log.debug(f"Part {part} downloaded")
+
+            log.debug("Parallel download finished, cleaning up connections")
+        finally:
             for task in tasks:
-                data = await task
-                if not data:
-                    break
-                yield data
-                part += 1
-            log.debug(f"Part {part} downloaded")
-
-        log.debug("Parallel download finished, cleaning up connections")
-        await self._cleanup()
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            await self._cleanup(abort=True)
 
 
 parallel_transfer_locks: DefaultDict[int, asyncio.Lock] = defaultdict(lambda: asyncio.Lock())
@@ -264,6 +282,15 @@ async def _internal_transfer_to_telegram(client: TelegramClient,
 
     hash_md5 = hashlib.md5()
     uploader = ParallelTransferrer(client)
+    try:
+        return await _run_upload(uploader, response, file_id, file_size, hash_md5,
+                                 progress_callback)
+    except BaseException:
+        await uploader._cleanup(abort=True)  # don't leak the extra connections
+        raise
+
+
+async def _run_upload(uploader, response, file_id, file_size, hash_md5, progress_callback):
     part_size, part_count, is_large = await uploader.init_upload(file_id, file_size)
     buffer = bytearray()
     for data in stream_file(response):
@@ -305,12 +332,16 @@ async def download_file(client: TelegramClient,
     # We lock the transfers because telegram has connection count limits
     downloader = ParallelTransferrer(client, dc_id)
     downloaded = downloader.download(location, size, connection_count=connection_count)
-    async for x in downloaded:
-        out.write(x)
-        if progress_callback:
-            r = progress_callback(out.tell(), size)
-            if inspect.isawaitable(r):
-                await r
+    try:
+        async for x in downloaded:
+            out.write(x)
+            if progress_callback:
+                r = progress_callback(out.tell(), size)
+                if inspect.isawaitable(r):
+                    await r
+    finally:
+        # Closing the generator runs its cleanup even on error/cancel.
+        await downloaded.aclose()
 
     return out
 

@@ -99,6 +99,18 @@ Klasik indirici Telegram'ın sunucu filtresini kullandığı için metin mesajla
 - `.env` içindeki `SEND_DELAY` (varsayılan 2 sn) gönderimler arası beklemedir; FloodWait gelirse otomatik beklenir.
 - Hedef kanalda mesaj gönderme yetkiniz olmalı. Kişisel hesap yükleme sınırı 2 GB (Premium 4 GB).
 
+### Otomatik toparlanma ve yeniden başlatma
+
+`ordered_mirror.py` kesilirse kendi kendine devam eder; her seferinde komutu yeniden verip soruları cevaplamanız gerekmez.
+
+- **Soruların cevapları kaydedilir** (`src/mirrors/run_state.json`): mod, kaynak, hedef, alt başlık, sessiz gönderim, silme seçeneği. Program yeniden başladığında bunları tekrar sormaz.
+- **Bağlantı kopması, zaman aşımı, sunucu hatası, takılan indirme/yükleme** durumunda program bekleyip (3 sn'den 2 dk'ya kadar artan aralıkla) kaldığı yerden otomatik devam eder. İnternet saatlerce gitse bile bağlantı gelince devam eder.
+- **Program tamamen kapanırsa** (hata, çökme, sonlandırma) küçük bir üst süreç (`auto_restart.py`) 10 sn sonra programı kayıtlı cevaplarla yeniden başlatır.
+- Otomatik **durmayan** tek durumlar, bir insanın müdahalesi gereken durumlardır: hedefte yazma yetkisi yok, kaynak kanal korumalı, Telegram oturumu geçersiz, disk dolu, ya da aynı hata ilerleme olmadan art arda 15 kez (`AUTO_RESTART_LIMIT`) tekrarlanmış. Sıra bozulmasın diye hiçbir öğe atlanmaz.
+- Yarım kalan bir işi bilerek durdurup yeni iş başlatmak için programı elle başlatıp "Önceki işlem tamamlanmamış, devam edilsin mi?" sorusuna **N** deyin. Otomatik yeniden başlatmayı kapatmak için `python ordered_mirror.py --no-restart`.
+- Windows'ta program çalışırken bilgisayarın uykuya geçmesi engellenir (ekran kapanabilir).
+- `.env` ile ayarlanabilir: `STALL_TIMEOUT` (ilerleme olmadan beklenecek süre, varsayılan 180 sn), `REQUEST_TIMEOUT` (300 sn), `AUTO_RESTART_LIMIT` (15), `RESTART_DELAY` (10 sn).
+
 ## Advanced Configuration
 
 ### Finding a Channel/Group ID

@@ -81,6 +81,7 @@ ORDER_LIST_NAME = "SIRA.txt"
 # back to back triggers FloodWait quickly; a small steady delay is faster
 # overall than repeatedly hitting multi-minute waits.
 SEND_DELAY = float(os.getenv("SEND_DELAY", "2"))
+RESUME_CHUNK = 512 * 1024  # partial downloads resume on this boundary
 FORWARD_CHUNK = 100  # Telegram's max message IDs per ForwardMessages call
 
 # --- self-healing settings (all overridable from .env) ---
@@ -281,6 +282,28 @@ def save_manifest(folder: Path, manifest):
     os.replace(tmp, path)
 
 
+def get_progress(manifest, target, create=False):
+    """Find (or create) the per-target progress record.
+
+    Older runs / helper scripts stored the key as "2974652532" and others as
+    "-1002974652532". If the two disagree, progress looks empty and EVERYTHING
+    is downloaded and sent again. Both spellings are accepted here and merged
+    into one canonical key (keeping the furthest progress)."""
+    sent = manifest.setdefault("sent", {})
+    key = str(target.id)
+    alt = str(utils.get_peer_id(target))
+    found = [sent[k] for k in dict.fromkeys((key, alt)) if k in sent]
+    if found:
+        best = max(found, key=lambda r: r.get("last_n", 0))
+        sent.pop(alt, None)
+        sent[key] = best
+        return best
+    if create:
+        sent[key] = {"title": getattr(target, "title", key), "last_n": 0}
+        return sent[key]
+    return None
+
+
 def write_order_list(folder: Path, manifest):
     lines = []
     for item in manifest["items"]:
@@ -458,7 +481,31 @@ async def download_part(client, channel, message, part, folder, semaphore):
                     and message.document
                     and file_info["size"] >= FAST_DOWNLOAD_MIN_MB * 1024 * 1024
                 )
-                if use_fast:
+                resume_from = 0
+                if message.document and file_info["size"] and tmp.exists():
+                    resume_from = (tmp.stat().st_size // RESUME_CHUNK) * RESUME_CHUNK
+                    if resume_from >= file_info["size"]:
+                        resume_from = 0
+                if resume_from:
+                    # Continue the interrupted .part file instead of starting over.
+                    async def resume_download(offset=resume_from):
+                        with open(tmp, "r+b") as out:
+                            out.truncate(offset)
+                            out.seek(offset)
+                            written = offset
+                            callback(written, file_info["size"])
+                            async for chunk in client.iter_download(
+                                message.document,
+                                offset=offset,
+                                request_size=RESUME_CHUNK,
+                                file_size=file_info["size"],
+                            ):
+                                out.write(chunk)
+                                written += len(chunk)
+                                callback(written, file_info["size"])
+
+                    await stall_guard(resume_download(), activity, f"download {file_info['name']}")
+                elif use_fast:
                     with open(tmp, "wb") as out:
                         await stall_guard(
                             fast_parallel_download(
@@ -482,6 +529,8 @@ async def download_part(client, channel, message, part, folder, semaphore):
 
                 size = tmp.stat().st_size
                 if file_info["type"] != "photo" and file_info["size"] and size != file_info["size"]:
+                    if size > file_info["size"]:
+                        tmp.unlink(missing_ok=True)  # corrupt; start clean next time
                     raise RuntimeError(f"size mismatch {size} != {file_info['size']}")
                 os.replace(tmp, path)
                 break
@@ -508,7 +557,7 @@ async def download_part(client, channel, message, part, folder, semaphore):
                 await asyncio.sleep(2 * attempt)
         else:
             bar.close()
-            tmp.unlink(missing_ok=True)
+            # The .part file is kept so the next run resumes from it.
             print(
                 f"{Fore.RED}FAILED #{part['msg_id']} {file_info['name']}: {last_error}"
                 f"{Style.RESET_ALL} (indirilemedi)"
@@ -529,9 +578,22 @@ async def download_part(client, channel, message, part, folder, semaphore):
 
 
 async def download_all(client, channel, folder: Path, manifest, message_cache, items=None):
+    if items is None:
+        # Items already sent to any target were probably deleted locally
+        # (delete-after-send); do not download them again.
+        sent_upto = max((v.get("last_n", 0) for v in manifest.get("sent", {}).values()), default=0)
+        source_items = [i for i in manifest["items"] if i["n"] > sent_upto]
+        if sent_upto:
+            info(
+                f"Skipping items up to #{sent_upto:05d} (already sent).",
+                f"#{sent_upto:05d} numaraya kadar olanlar zaten gonderilmis, atlaniyor.",
+                Fore.YELLOW,
+            )
+    else:
+        source_items = items
     pending = [
         part
-        for item in (manifest["items"] if items is None else items)
+        for item in source_items
         for part in item["parts"]
         if part.get("file") and not part.get("skip") and not file_is_complete(folder, part["file"])
     ]
@@ -726,10 +788,7 @@ def delete_item_files(folder: Path, item):
 
 
 async def send_all(client, target, folder: Path, manifest, silent: bool, upto_n=None, delete_after=False, topic_id=None):
-    key = str(target.id)
-    progress = manifest.setdefault("sent", {}).setdefault(
-        key, {"title": getattr(target, "title", str(target.id)), "last_n": 0}
-    )
+    progress = get_progress(manifest, target, create=True)
     todo = [
         item
         for item in manifest["items"]
@@ -790,10 +849,7 @@ async def send_all(client, target, folder: Path, manifest, silent: bool, upto_n=
 async def forward_all(client, channel, target, folder: Path, manifest, silent: bool, topic_id=None):
     """Copy without downloading: forward in order with the 'Forwarded from'
     header removed. Albums are never split across requests."""
-    key = str(target.id)
-    progress = manifest.setdefault("sent", {}).setdefault(
-        key, {"title": getattr(target, "title", str(target.id)), "last_n": 0}
-    )
+    progress = get_progress(manifest, target, create=True)
     todo = [item for item in manifest["items"] if item["n"] > progress["last_n"]]
     chunk_items = []
 
@@ -1027,15 +1083,17 @@ async def resolve_target_topic(client, target, topic_title):
     )
 
 
-async def choose_source(client):
-    """Interactive: pick the source chat/topic/range and create (or continue)
-    its mirror folder. Nothing is scanned here; execute_plan does that, so a
-    restart goes through exactly the same code path."""
-    channel = await ask_chat(
-        client, "Source channel/group (link, @username, ID or name)", "Kaynak kanal/grup"
-    )
+async def choose_source(client, channel=None, topic_override=None, auto_resume=False):
+    """Pick the source chat/topic/range and create (or continue) its mirror
+    folder. Nothing is scanned here; execute_plan does that, so a restart goes
+    through exactly the same code path. Returns (channel, folder)."""
+    if channel is None:
+        channel = await ask_chat(
+            client, "Source channel/group (link, @username, ID or name)", "Kaynak kanal/grup"
+        )
     topic_id, topic_title = (
-        await pick_topic(client, channel) if getattr(channel, "forum", False) else (None, None)
+        topic_override if topic_override is not None else
+        (await pick_topic(client, channel) if getattr(channel, "forum", False) else (None, None))
     )
 
     title = safe_filename(getattr(channel, "title", "chat"))[:60]
@@ -1050,26 +1108,32 @@ async def choose_source(client):
         and (p / MANIFEST_NAME).exists()
     ]
     folder = None
-    for candidate in existing:
-        if ask_yes_no(
-            f"Continue the existing mirror '{candidate.name}' (only new messages are scanned)?",
-            f"Mevcut '{candidate.name}' klasorunden devam edilsin mi (sadece yeni mesajlar taranir)?",
-        ):
-            folder = candidate
-            break
+    if auto_resume and existing:
+        folder = next((p for p in existing if p.name == base_name), None)
+    if not auto_resume:
+        for candidate in existing:
+            if ask_yes_no(
+                f"Continue the existing mirror '{candidate.name}' (only new messages are scanned)?",
+                f"Mevcut '{candidate.name}' klasorunden devam edilsin mi (sadece yeni mesajlar taranir)?",
+            ):
+                folder = candidate
+                break
 
     if not folder:
-        info(
-            "Optional range: paste a message link or ID; leave empty for the whole chat.",
-            "Istege bagli aralik: mesaj linki veya ID yapistirin; bos = tum sohbet.",
-        )
-        while True:
-            try:
-                min_id = parse_message_id(input("  Start / Baslangic (dahil): "))
-                max_id = parse_message_id(input("  End / Bitis (dahil): "))
-                break
-            except ValueError:
-                info("Invalid ID or link.", "Gecersiz ID/link.", Fore.RED)
+        if auto_resume:
+            min_id = max_id = 0
+        else:
+            info(
+                "Optional range: paste a message link or ID; leave empty for the whole chat.",
+                "Istege bagli aralik: mesaj linki veya ID yapistirin; bos = tum sohbet.",
+            )
+            while True:
+                try:
+                    min_id = parse_message_id(input("  Start / Baslangic (dahil): "))
+                    max_id = parse_message_id(input("  End / Bitis (dahil): "))
+                    break
+                except ValueError:
+                    info("Invalid ID or link.", "Gecersiz ID/link.", Fore.RED)
         suffix = f"_{min_id or 'bas'}-{max_id or 'son'}" if (min_id or max_id) else ""
         folder = MIRRORS_DIR / (base_name + suffix)
         folder.mkdir(parents=True, exist_ok=True)
@@ -1106,6 +1170,14 @@ async def scan_and_report(client, channel, folder: Path, manifest, message_cache
     )
 
 
+async def prepare_source(client, message_cache, channel=None, topic_override=None, auto_resume=False):
+    """choose_source + incremental scan; used by the all-topics mode."""
+    channel, folder = await choose_source(client, channel, topic_override, auto_resume)
+    manifest = load_manifest(folder)
+    await scan_and_report(client, channel, folder, manifest, message_cache)
+    return channel, folder, manifest
+
+
 def pick_existing_folder():
     folders = sorted(
         (p for p in MIRRORS_DIR.glob("*") if (p / MANIFEST_NAME).exists()),
@@ -1126,7 +1198,7 @@ def pick_existing_folder():
 async def ask_target_and_options(client, manifest):
     target = await ask_chat(client, "Target channel to post into", "Gonderilecek hedef kanal")
     target_topic_id = await resolve_target_topic(client, target, manifest.get("topic_title"))
-    progress = manifest.get("sent", {}).get(str(target.id))
+    progress = get_progress(manifest, target)
     if progress and progress["last_n"]:
         if not ask_yes_no(
             f"Resume after item #{progress['last_n']:05d}?",
@@ -1138,6 +1210,86 @@ async def ask_target_and_options(client, manifest):
         "Sessiz gonderilsin mi (her mesaj icin bildirim gitmesin)?",
     )
     return target, silent, target_topic_id
+
+
+async def setup_all_topics(client):
+    """Mode 5 questions (asked once; the answers are saved in the run state)."""
+    channel = await ask_chat(
+        client, "Source forum group (link, @username, ID or name)", "Kaynak forum grubu"
+    )
+    if not getattr(channel, "forum", False):
+        info("Source is not a forum.", "Kaynak bir forum grubu degil.", Fore.RED)
+        return None
+    target = await ask_chat(client, "Target forum group", "Hedef forum grubu")
+    if not getattr(target, "forum", False):
+        info("Target must be a forum group.", "Hedef bir forum grubu olmali.", Fore.RED)
+        return None
+    if target.id == channel.id:
+        info("Source and target must differ.", "Kaynak ve hedef farkli olmali.", Fore.RED)
+        return None
+    silent = ask_yes_no(
+        "Post silently (no notification for each message)?",
+        "Sessiz gonderilsin mi (her mesaj icin bildirim gitmesin)?",
+    )
+    delete_after = ask_yes_no(
+        "Delete each local file after sending?",
+        "Gonderilen her dosya yerelden silinsin mi?",
+    )
+    return {
+        "mode": "5",
+        "folder": None,
+        "source_peer": utils.get_peer_id(channel),
+        "target_peer": utils.get_peer_id(target),
+        "silent": silent,
+        "delete_after": delete_after,
+        "created": datetime.now(timezone.utc).isoformat(),
+        "finished": False,
+    }
+
+
+async def run_all_topics(client, plan, message_cache):
+    """Transfer all source forum topics, resuming each topic independently.
+    Safe to call again after a failure: finished topics are skipped quickly."""
+    channel = await resolve_peer(client, plan["source_peer"], "Source")
+    target = await resolve_peer(client, plan["target_peer"], "Target")
+    silent = plan.get("silent", False)
+    delete_after = plan.get("delete_after", False)
+    topics = await load_topics(client, channel)
+    if not topics:
+        raise OrderStop("No topics found. (Alt baslik bulunamadi.)", fatal=True)
+
+    info(f"Transferring {len(topics)} topics.", f"{len(topics)} alt baslik aktarilacak.")
+    for index, topic in enumerate(topics, 1):
+        info(f"Topic {index}/{len(topics)}: {topic.title}",
+             f"Alt baslik {index}/{len(topics)}: {topic.title}")
+        _, folder, manifest = await prepare_source(
+            client, message_cache, channel=channel,
+            topic_override=(topic.id, topic.title), auto_resume=True,
+        )
+        progress = get_progress(manifest, target) or {}
+        todo = [item for item in manifest["items"] if item["n"] > progress.get("last_n", 0)]
+        if not todo:
+            continue
+        target_topic_id = await resolve_target_topic(client, target, topic.title)
+        if not target_topic_id:
+            raise OrderStop(f"Could not resolve target topic: {topic.title}")
+        if not delete_after:
+            failed = await download_all(client, channel, folder, manifest, message_cache, todo)
+            if failed:
+                raise OrderStop(f"Download failed in topic {topic.title}; will retry.")
+            await send_all(client, target, folder, manifest, silent, topic_id=target_topic_id)
+            continue
+        window = max(1, batch_size) * 2
+        for start in range(0, len(todo), window):
+            chunk = todo[start:start + window]
+            failed = await download_all(client, channel, folder, manifest, message_cache, chunk)
+            if failed:
+                raise OrderStop(f"Download failed in topic {topic.title}; will retry.")
+            await send_all(
+                client, target, folder, manifest, silent,
+                upto_n=chunk[-1]["n"], delete_after=True, topic_id=target_topic_id,
+            )
+    info("All topics transferred.", "Tum alt basliklar aktarildi.", Fore.GREEN)
 
 
 # ---------------------------------------------------------------------------
@@ -1202,6 +1354,9 @@ async def execute_plan(client, plan, message_cache):
     """Run the saved plan from wherever it currently stands. Everything here
     is resumable, so the recovery loop simply calls it again after a failure."""
     mode = plan["mode"]
+    if mode == "5":
+        await run_all_topics(client, plan, message_cache)
+        return
     folder = MIRRORS_DIR / plan["folder"]
     manifest = load_manifest(folder)  # fresh from disk: it is the source of truth
     if manifest is None:
@@ -1231,7 +1386,7 @@ async def execute_plan(client, plan, message_cache):
             # Send-only mode never downloads, so retrying can't fix this.
             raise OrderStop(str(stop), fatal=True)
     else:  # mode 3: download + send
-        progress = manifest.get("sent", {}).get(str(target.id), {})
+        progress = get_progress(manifest, target) or {}
         todo = [i for i in manifest["items"] if i["n"] > progress.get("last_n", 0)]
 
         if not plan.get("delete_after"):
@@ -1331,11 +1486,15 @@ async def interactive_setup(client):
         "3. Download + send                              / Indir + gonder\n"
         "4. Direct copy without download (no 'forwarded' tag; not for protected channels)\n"
         "                                                / Indirmeden dogrudan kopyala\n"
+        "5. Mirror all forum topics automatically        / Tum alt basliklari otomatik aktar\n"
     )
-    mode = input(f"{Fore.CYAN}Choice (1-4): {Style.RESET_ALL}").strip()
-    if mode not in ("1", "2", "3", "4"):
+    mode = input(f"{Fore.CYAN}Choice (1-5): {Style.RESET_ALL}").strip()
+    if mode not in ("1", "2", "3", "4", "5"):
         info("Invalid choice.", "Gecersiz secim.", Fore.RED)
         return None
+
+    if mode == "5":
+        return await setup_all_topics(client)
 
     if mode == "2":
         folder = pick_existing_folder()
@@ -1386,7 +1545,7 @@ async def main() -> int:
     state = load_state()
     if state and not state.get("finished"):
         if AUTO_MODE or ask_yes_no(
-            f"An earlier run (mode {state.get('mode')}, '{state.get('folder')}') did not finish. "
+            f"An earlier run (mode {state.get('mode')}, '{state.get('folder') or 'all topics'}') did not finish. "
             f"Resume it where it stopped?",
             "Onceki islem tamamlanmamis. Kaldigi yerden devam edilsin mi? (Hayir = yeni islem)",
         ):

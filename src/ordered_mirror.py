@@ -87,6 +87,113 @@ SEND_DELAY = float(os.getenv("SEND_DELAY", "2"))
 RESUME_CHUNK = 512 * 1024  # partial downloads resume on this boundary
 FORWARD_CHUNK = 100  # Telegram's max message IDs per ForwardMessages call
 
+# --- automatic pacing ---
+# SEND_DELAY is only the starting value. After every FloodWait the pause is
+# recalculated so the long-run speed fits what Telegram allowed (work time
+# vs. ban time, plus a safety margin); after a long stretch without bans it
+# is lowered a little again. The learned value is saved and reused next run.
+SEND_DELAY_MIN = float(os.getenv("SEND_DELAY_MIN", "1"))
+SEND_DELAY_MAX = float(os.getenv("SEND_DELAY_MAX", "60"))
+PACING_SAFETY = 1.3          # aim 30% below the speed that got banned
+PACING_RELAX_AFTER = 1800    # seconds without a ban before speeding up again
+PACING_RELAX_FACTOR = 0.9    # each relax step shortens the pause by 10%
+PACING_NAME = "pacing.json"
+
+
+class Pacer:
+    def __init__(self):
+        self.delay = SEND_DELAY
+        self.loaded = False
+        now = time.monotonic()
+        self.work_since = now      # start of the current ban-free stretch
+        self.last_relax = now
+        self.last_step = None      # end of the previous pause
+        self.cycles = []           # recent real time per posting step
+        self.relax_after = PACING_RELAX_AFTER
+
+    def _path(self):
+        return MIRRORS_DIR / PACING_NAME
+
+    def load(self):
+        if self.loaded:
+            return
+        self.loaded = True
+        try:
+            saved = json.loads(self._path().read_text(encoding="utf-8"))
+            self.delay = min(max(float(saved["delay"]), SEND_DELAY_MIN), SEND_DELAY_MAX)
+            info(
+                f"Learned send delay: {self.delay:.1f}s",
+                f"Ogrenilmis bekleme suresi: {self.delay:.1f} sn",
+            )
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+
+    def save(self):
+        try:
+            MIRRORS_DIR.mkdir(parents=True, exist_ok=True)
+            self._path().write_text(
+                json.dumps({"delay": round(self.delay, 2),
+                            "updated": datetime.now(timezone.utc).isoformat()}),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+
+    async def pause(self):
+        """Wait between two posts; also measures how long a step really takes."""
+        self.load()
+        now = time.monotonic()
+        if self.last_step is not None:
+            self.cycles.append(now - self.last_step + self.delay)
+            del self.cycles[:-50]
+        if (now - self.work_since >= self.relax_after
+                and now - self.last_relax >= self.relax_after
+                and self.delay > SEND_DELAY_MIN):
+            self.last_relax = now
+            self.delay = max(SEND_DELAY_MIN, self.delay * PACING_RELAX_FACTOR)
+            self.save()
+            info(
+                f"No ban for a while; send delay lowered to {self.delay:.1f}s",
+                f"Uzun suredir ban yok; bekleme {self.delay:.1f} sn'ye dusuruldu",
+                Fore.GREEN,
+            )
+        await asyncio.sleep(self.delay)
+        self.last_step = time.monotonic()
+
+    async def flood_wait(self, seconds: int):
+        """Recalculate the pause from this ban, then sit the ban out."""
+        self.load()
+        now = time.monotonic()
+        work = max(now - self.work_since, 1.0)
+        if self.cycles:
+            ordered = sorted(self.cycles)
+            cycle = ordered[len(ordered) // 2]
+        else:
+            cycle = self.delay + 1.5
+        overhead = max(cycle - self.delay, 0.0)
+        needed = cycle * (work + seconds) / work * PACING_SAFETY
+        old = self.delay
+        self.delay = min(SEND_DELAY_MAX, max(SEND_DELAY_MIN, needed - overhead, old * 1.1))
+        # Only speed up again after staying ban-free for twice as long as it
+        # took to get banned this time.
+        self.relax_after = max(PACING_RELAX_AFTER, 2 * work)
+        self.save()
+        minutes = (seconds + 59) // 60
+        info(
+            f"Flood wait {seconds}s (~{minutes} min). Worked {work / 60:.0f} min before it; "
+            f"send delay {old:.1f}s -> {self.delay:.1f}s",
+            f"Telegram {seconds} sn (~{minutes} dk) bekletiyor. Oncesinde {work / 60:.0f} dk calisti; "
+            f"bekleme {old:.1f} sn -> {self.delay:.1f} sn",
+            Fore.YELLOW,
+        )
+        await asyncio.sleep(seconds + 1)
+        now = time.monotonic()
+        self.work_since = self.last_relax = now
+        self.last_step = None
+
+
+pacer = Pacer()
+
 # --- self-healing settings (all overridable from .env) ---
 # Seconds a transfer may go without any progress before it is aborted and
 # retried; a silently hung connection otherwise freezes the program forever.
@@ -1141,8 +1248,7 @@ async def send_all(client, target, folder: Path, manifest, silent: bool, upto_n=
                     last_id = max(last_id, new_id or 0)
                     break
                 except FloodWaitError as error:
-                    info(f"Flood wait {error.seconds}s...", f"Telegram {error.seconds}sn bekletiyor...", Fore.YELLOW)
-                    await asyncio.sleep(error.seconds + 1)
+                    await pacer.flood_wait(error.seconds)
                 except (ChatWriteForbiddenError, ChatAdminRequiredError) as error:
                     raise OrderStop(
                         f"No permission to post in the target: {error} "
@@ -1195,7 +1301,7 @@ async def send_all(client, target, folder: Path, manifest, silent: bool, upto_n=
         if delete_after:
             delete_item_files(folder, item)
         if posted:
-            await asyncio.sleep(SEND_DELAY)
+            await pacer.pause()
 
     if upto_n is None:
         info("All items sent in the original order.", "Tum ogeler orijinal sirayla gonderildi.", Fore.GREEN)
@@ -1251,8 +1357,7 @@ async def forward_all(client, channel, target, folder: Path, manifest, silent: b
                     )
                 break
             except FloodWaitError as error:
-                info(f"Flood wait {error.seconds}s...", f"Telegram {error.seconds}sn bekletiyor...", Fore.YELLOW)
-                await asyncio.sleep(error.seconds + 1)
+                await pacer.flood_wait(error.seconds)
             except (RPCError, OSError, ConnectionError) as error:
                 if not delivery_unclear(error):
                     raise
@@ -1272,7 +1377,7 @@ async def forward_all(client, channel, target, folder: Path, manifest, silent: b
         state["last_id"] = await with_timeout(newest_message_id(client, target, topic_id), "read target")
         print(f"{Fore.GREEN}COPIED{Style.RESET_ALL} up to #{progress['last_n']:05d}")
         chunk_items.clear()
-        await asyncio.sleep(SEND_DELAY)
+        await pacer.pause()
 
     try:
         if todo:

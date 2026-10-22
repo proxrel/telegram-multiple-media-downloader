@@ -1974,7 +1974,9 @@ async def prepare_source(client, message_cache, channel=None, topic_override=Non
     return channel, folder, manifest
 
 
-def pick_existing_folder():
+def pick_existing_folders():
+    """List the downloaded mirror folders and let the user pick one or more
+    ("hepsi", "1,3", "2-5"). Returns a list of folders (or None)."""
     folders = sorted(
         (p for p in MIRRORS_DIR.glob("*") if (p / MANIFEST_NAME).exists()),
         key=lambda p: p.stat().st_mtime,
@@ -1985,10 +1987,19 @@ def pick_existing_folder():
         return None
     for index, folder in enumerate(folders, 1):
         print(f"  {index}. {folder.name}")
+    print("\nExamples / Ornekler:  2  |  all (hepsi)  |  1,3  |  2-5")
     while True:
-        choice = input(f"{Fore.CYAN}Select folder (Klasor secin): {Style.RESET_ALL}").strip()
-        if choice.isdigit() and 1 <= int(choice) <= len(folders):
-            return folders[int(choice) - 1]
+        raw = input(f"{Fore.CYAN}Select folder(s) (Klasor(ler) secin): {Style.RESET_ALL}").strip()
+        if not raw:
+            continue
+        numbers = parse_topic_selection(raw, len(folders))
+        if numbers:
+            return [folders[number - 1] for number in numbers]
+        info(
+            f"Invalid selection; use numbers 1-{len(folders)}, commas and dashes.",
+            f"Gecersiz secim; 1-{len(folders)} arasi sayi, virgul ve tire kullanin.",
+            Fore.RED,
+        )
 
 
 async def ask_target_and_options(client, manifest):
@@ -2193,12 +2204,42 @@ async def run_all_topics(client, plan, message_cache):
     info("All topics transferred.", "Tum alt basliklar aktarildi.", Fore.GREEN)
 
 
-async def run_forward_topics(client, plan, message_cache):
-    """Mode 4 with several source topics: direct-copy each one in turn. A
-    forum target gets a same-titled topic per source topic; any other target
-    receives them one after another. Each topic resumes independently."""
+async def download_and_send(client, channel, target, folder, manifest, message_cache,
+                            silent, delete_after, topic_id, label):
+    """Mode 3 work for one mirror folder (shared by the multi-topic runs)."""
+    progress = get_progress(manifest, target, topic_id=topic_id) or {}
+    todo = [item for item in manifest["items"] if item["n"] > progress.get("last_n", 0)]
+    if not todo:
+        save_manifest(folder, manifest)  # progress keys may have been normalised
+        return
+    if not delete_after:
+        failed = await download_all(client, channel, folder, manifest, message_cache, todo)
+        if failed:
+            raise OrderStop(f"Download failed in {label}; will retry.")
+        await send_all(client, target, folder, manifest, silent, topic_id=topic_id)
+        return
+    window = max(1, batch_size) * 2
+    for start in range(0, len(todo), window):
+        chunk = todo[start:start + window]
+        failed = await download_all(client, channel, folder, manifest, message_cache, chunk)
+        if failed:
+            raise OrderStop(f"Download failed in {label}; will retry.")
+        await send_all(
+            client, target, folder, manifest, silent,
+            upto_n=chunk[-1]["n"], delete_after=True, topic_id=topic_id,
+        )
+
+
+async def run_selected_topics(client, plan, message_cache):
+    """Modes 1, 3 and 4 with several source topics picked: each topic gets its
+    own mirror folder and is handled in turn, resuming independently. A forum
+    target gets a same-titled topic per source topic; any other target
+    receives the topics one after another."""
+    mode = plan["mode"]
     channel = await resolve_peer(client, plan["source_peer"], "Source")
-    target = await resolve_peer(client, plan["target_peer"], "Target")
+    target = None
+    if plan.get("target_peer") is not None:
+        target = await resolve_peer(client, plan["target_peer"], "Target")
     silent = plan.get("silent", False)
     topics = await load_topics(client, channel)
     by_id = {topic.id: topic for topic in topics}
@@ -2210,27 +2251,69 @@ async def run_forward_topics(client, plan, message_cache):
         )
 
     target_topics = None
-    if getattr(target, "forum", False):
+    if target is not None and getattr(target, "forum", False):
         try:
             target_topics = await load_topics(client, target)
         except RPCError:
             target_topics = None
-    info(f"Copying {len(topics)} topics.", f"{len(topics)} alt baslik kopyalanacak.")
+    info(f"{len(topics)} topics selected.", f"{len(topics)} alt baslik islenecek.")
     for index, topic in enumerate(topics, 1):
         info(f"Topic {index}/{len(topics)}: {topic.title}",
              f"Alt baslik {index}/{len(topics)}: {topic.title}")
         _, folder, manifest = await prepare_source(
             client, message_cache, channel=channel,
             topic_override=(topic.id, topic.title), auto_resume=True,
-            reuse_old=False, target=target,
+            reuse_old=plan.get("reuse_old", False), target=target,
         )
+        if mode == "1":
+            failed = await download_all(client, channel, folder, manifest, message_cache)
+            if failed:
+                raise OrderStop(f"{failed} file(s) could not be downloaded in topic {topic.title}")
+            continue
         if not manifest["items"]:
             continue  # empty source topic: do not create an empty one on the target
         target_topic_id = await resolve_target_topic(client, target, topic.title, known_topics=target_topics)
         if getattr(target, "forum", False) and not target_topic_id:
             raise OrderStop(f"Could not resolve target topic: {topic.title}")
-        await forward_all(client, channel, target, folder, manifest, silent, topic_id=target_topic_id)
-    info("All selected topics copied.", "Secilen tum alt basliklar kopyalandi.", Fore.GREEN)
+        if mode == "4":
+            await forward_all(client, channel, target, folder, manifest, silent, topic_id=target_topic_id)
+        else:
+            await download_and_send(
+                client, channel, target, folder, manifest, message_cache, silent,
+                plan.get("delete_after", False), target_topic_id, f"topic {topic.title}",
+            )
+    info("All selected topics done.", "Secilen tum alt basliklar tamamlandi.", Fore.GREEN)
+
+
+async def run_selected_folders(client, plan):
+    """Mode 2 with several downloaded folders: send each one in turn. On a
+    forum target a folder that came from a topic goes into the same-titled
+    topic; a folder without a topic goes to General."""
+    target = await resolve_peer(client, plan["target_peer"], "Target")
+    silent = plan.get("silent", False)
+    target_topics = None
+    if getattr(target, "forum", False):
+        try:
+            target_topics = await load_topics(client, target)
+        except RPCError:
+            target_topics = None
+    names = plan["folders"]
+    for index, name in enumerate(names, 1):
+        folder = MIRRORS_DIR / name
+        manifest = load_manifest(folder)
+        if manifest is None:
+            raise OrderStop(f"{folder / MANIFEST_NAME} is missing. (manifest.json bulunamadi.)", fatal=True)
+        check_manifest_paths(folder, manifest)
+        info(f"Folder {index}/{len(names)}: {name}", f"Klasor {index}/{len(names)}: {name}")
+        title = manifest.get("topic_title")
+        topic_id = None
+        if title and getattr(target, "forum", False):
+            topic_id = await resolve_target_topic(client, target, title, known_topics=target_topics)
+        try:
+            await send_all(client, target, folder, manifest, silent, topic_id=topic_id)
+        except MissingFileStop as stop:
+            raise OrderStop(f"{name}: {stop}", fatal=True)
+    info("All selected folders sent.", "Secilen tum klasorler gonderildi.", Fore.GREEN)
 
 
 # ---------------------------------------------------------------------------
@@ -2298,8 +2381,11 @@ async def execute_plan(client, plan, message_cache):
     if mode == "5":
         await run_all_topics(client, plan, message_cache)
         return
-    if mode == "4" and plan.get("topic_ids"):
-        await run_forward_topics(client, plan, message_cache)
+    if mode in ("1", "3", "4") and plan.get("topic_ids"):
+        await run_selected_topics(client, plan, message_cache)
+        return
+    if mode == "2" and plan.get("folders"):
+        await run_selected_folders(client, plan)
         return
     folder = MIRRORS_DIR / plan["folder"]
     manifest = load_manifest(folder)  # fresh from disk: it is the source of truth
@@ -2424,10 +2510,46 @@ async def run_plan(client, plan) -> int:
         await asyncio.sleep(delay)
 
 
-async def setup_forward_topics(client, channel, topic_ids):
-    """Mode 4 questions when several source topics were picked."""
+async def setup_selected_topics(client, mode, channel, topic_ids):
+    """Questions for modes 1, 3 and 4 when several source topics were picked."""
+    plan = {
+        "mode": mode,
+        "folder": None,
+        "source_peer": utils.get_peer_id(channel),
+        "target_peer": None,
+        "topic_ids": topic_ids,
+        "created": datetime.now(timezone.utc).isoformat(),
+        "finished": False,
+    }
+    if mode != "4":
+        plan["reuse_old"] = other_mirrors_exist(channel.id) and ask_yes_no(
+            "Was this chat re-created from an earlier one (same topic titles = same content)? "
+            "Skip what was already downloaded/sent for those topics?",
+            "Bu sohbet eskisinin yeniden acilmis hali mi (ayni alt baslik adi = ayni icerik)? "
+            "O alt basliklar icin daha once indirilen/gonderilenler atlansin mi?",
+        )
+    if mode == "1":
+        return plan
+    target = await ask_target_chat(client, channel)
+    if target is None:
+        return None
+    plan["target_peer"] = utils.get_peer_id(target)
+    plan["silent"] = ask_yes_no(
+        "Post silently (no notification for each message)?",
+        "Sessiz gonderilsin mi (her mesaj icin bildirim gitmesin)?",
+    )
+    if mode == "3":
+        plan["delete_after"] = ask_yes_no(
+            "Delete each file from this computer right after it is sent?",
+            "Her dosya gonderildikten hemen sonra bu bilgisayardan silinsin mi?",
+        )
+    return plan
+
+
+async def ask_target_chat(client, source=None):
+    """Ask for the target and explain where multi-topic content will land."""
     target = await ask_chat(client, "Target channel to post into", "Gonderilecek hedef kanal")
-    if target.id == channel.id:
+    if source is not None and target.id == source.id:
         info("Source and target must differ.", "Kaynak ve hedef farkli olmali.", Fore.RED)
         return None
     if getattr(target, "forum", False):
@@ -2437,24 +2559,11 @@ async def setup_forward_topics(client, channel, topic_ids):
         )
     else:
         info(
-            "Target is not a forum: the selected topics are posted one after another.",
-            "Hedef forum degil: secilen alt basliklar arka arkaya gonderilecek.",
+            "Target is not a forum: the selected items are posted one after another.",
+            "Hedef forum degil: secilenler arka arkaya gonderilecek.",
             Fore.YELLOW,
         )
-    silent = ask_yes_no(
-        "Post silently (no notification for each message)?",
-        "Sessiz gonderilsin mi (her mesaj icin bildirim gitmesin)?",
-    )
-    return {
-        "mode": "4",
-        "folder": None,
-        "source_peer": utils.get_peer_id(channel),
-        "target_peer": utils.get_peer_id(target),
-        "topic_ids": topic_ids,
-        "silent": silent,
-        "created": datetime.now(timezone.utc).isoformat(),
-        "finished": False,
-    }
+    return target
 
 
 async def interactive_setup(client):
@@ -2478,15 +2587,33 @@ async def interactive_setup(client):
         return await setup_all_topics(client)
 
     if mode == "2":
-        folder = pick_existing_folder()
-        if not folder:
+        folders = pick_existing_folders()
+        if not folders:
             return None
+        if len(folders) > 1:
+            target = await ask_target_chat(client)
+            if target is None:
+                return None
+            return {
+                "mode": "2",
+                "folder": None,
+                "folders": [folder.name for folder in folders],
+                "source_peer": None,
+                "target_peer": utils.get_peer_id(target),
+                "silent": ask_yes_no(
+                    "Post silently (no notification for each message)?",
+                    "Sessiz gonderilsin mi (her mesaj icin bildirim gitmesin)?",
+                ),
+                "created": datetime.now(timezone.utc).isoformat(),
+                "finished": False,
+            }
+        folder = folders[0]
         channel = None
-    elif mode == "4":
+    else:
         channel = await ask_chat(
             client, "Source channel/group (link, @username, ID or name)", "Kaynak kanal/grup"
         )
-        if getattr(channel, "noforwards", False):
+        if mode == "4" and getattr(channel, "noforwards", False):
             info(
                 "This chat has content protection; direct copy will fail. Use mode 3.",
                 "Bu kanal korumali; dogrudan kopyalama calismaz, 3. modu kullanin.",
@@ -2495,12 +2622,10 @@ async def interactive_setup(client):
             return None
         picks = await pick_topics(client, channel) if getattr(channel, "forum", False) else None
         if picks and len(picks) > 1:
-            return await setup_forward_topics(client, channel, [topic_id for topic_id, _ in picks])
+            return await setup_selected_topics(client, mode, channel, [topic_id for topic_id, _ in picks])
         channel, folder = await choose_source(
             client, channel, topic_override=picks[0] if picks else (None, None)
         )
-    else:
-        channel, folder = await choose_source(client)
 
     plan = {
         "mode": mode,
@@ -2536,7 +2661,7 @@ async def main() -> int:
     state = load_state()
     if state and not state.get("finished"):
         if AUTO_MODE or ask_yes_no(
-            f"An earlier run (mode {state.get('mode')}, '{state.get('folder') or 'selected topics'}') did not finish. "
+            f"An earlier run (mode {state.get('mode')}, '{state.get('folder') or 'secilenler / selected items'}') did not finish. "
             f"Resume it where it stopped?",
             "Onceki islem tamamlanmamis. Kaldigi yerden devam edilsin mi? (Hayir = yeni islem)",
         ):

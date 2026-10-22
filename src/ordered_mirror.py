@@ -1432,11 +1432,12 @@ async def pick_topics(client, channel):
         return None
 
     print(f"\n{Fore.CYAN}Topics / Alt basliklar ({len(topics)}):{Style.RESET_ALL}")
-    print("  0. Whole chat (Tum sohbet)")
+    print("  0. Whole chat as one piece (Tum sohbet tek parca, alt basliklar karisik)")
+    print("  hepsi. All topics, each kept separate (Tum alt basliklar, her biri ayri)")
     for index, topic in enumerate(topics, 1):
         print(f"  {index}. {topic.title}")
     print(
-        "\nExamples / Ornekler:  0 (tum sohbet)  |  all (hepsi)  |  4-44  |  1,5,9-12  |  10-  (10'dan sona kadar)"
+        "\nExamples / Ornekler:  hepsi  |  3-40  |  1,5,9-12  |  10-  (10'dan sona kadar)  |  0"
     )
     while True:
         raw = input(

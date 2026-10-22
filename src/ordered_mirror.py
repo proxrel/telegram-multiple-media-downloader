@@ -1418,6 +1418,45 @@ async def pick_topic(client, channel):
     return topic.id, topic.title
 
 
+async def pick_topics(client, channel):
+    """Like pick_topic, but several topics can be picked at once ("hepsi",
+    "1,5,9-12", "10-"). Returns None for the whole chat, otherwise a list of
+    (topic_id, topic_title) in the order typed."""
+    info("Loading topics...", "Alt basliklar yukleniyor...")
+    try:
+        topics = await load_topics(client, channel)
+    except RPCError as error:
+        info(f"Could not load topics: {error}", "Alt basliklar yuklenemedi, tum sohbet kullanilacak.", Fore.RED)
+        return None
+    if not topics:
+        return None
+
+    print(f"\n{Fore.CYAN}Topics / Alt basliklar ({len(topics)}):{Style.RESET_ALL}")
+    print("  0. Whole chat (Tum sohbet)")
+    for index, topic in enumerate(topics, 1):
+        print(f"  {index}. {topic.title}")
+    print(
+        "\nExamples / Ornekler:  0 (tum sohbet)  |  all (hepsi)  |  4-44  |  1,5,9-12  |  10-  (10'dan sona kadar)"
+    )
+    while True:
+        raw = input(
+            f"{Fore.CYAN}Select topic(s) (Alt baslik(lar) secin) [0]: {Style.RESET_ALL}"
+        ).strip()
+        if raw in ("", "0"):
+            return None
+        numbers = parse_topic_selection(raw, len(topics))
+        if numbers is not None:
+            break
+        info(
+            f"Invalid selection; use 0 or numbers 1-{len(topics)}, commas and dashes.",
+            f"Gecersiz secim; 0 ya da 1-{len(topics)} arasi sayi, virgul ve tire kullanin.",
+            Fore.RED,
+        )
+    chosen = [topics[number - 1] for number in numbers]
+    info(f"{len(chosen)} topic(s) selected.", f"{len(chosen)} alt baslik secildi.", Fore.GREEN)
+    return [(topic.id, topic.title) for topic in chosen]
+
+
 async def resolve_target_topic(client, target, topic_title, known_topics=None):
     """Mirror the source topic on the target: if the source item came from a
     named topic and the target is itself a forum, reuse a same-titled topic
@@ -2154,6 +2193,46 @@ async def run_all_topics(client, plan, message_cache):
     info("All topics transferred.", "Tum alt basliklar aktarildi.", Fore.GREEN)
 
 
+async def run_forward_topics(client, plan, message_cache):
+    """Mode 4 with several source topics: direct-copy each one in turn. A
+    forum target gets a same-titled topic per source topic; any other target
+    receives them one after another. Each topic resumes independently."""
+    channel = await resolve_peer(client, plan["source_peer"], "Source")
+    target = await resolve_peer(client, plan["target_peer"], "Target")
+    silent = plan.get("silent", False)
+    topics = await load_topics(client, channel)
+    by_id = {topic.id: topic for topic in topics}
+    topics = [by_id[topic_id] for topic_id in plan["topic_ids"] if topic_id in by_id]
+    if not topics:
+        raise OrderStop(
+            "None of the selected topics exist any more. (Secilen alt basliklar bulunamadi.)",
+            fatal=True,
+        )
+
+    target_topics = None
+    if getattr(target, "forum", False):
+        try:
+            target_topics = await load_topics(client, target)
+        except RPCError:
+            target_topics = None
+    info(f"Copying {len(topics)} topics.", f"{len(topics)} alt baslik kopyalanacak.")
+    for index, topic in enumerate(topics, 1):
+        info(f"Topic {index}/{len(topics)}: {topic.title}",
+             f"Alt baslik {index}/{len(topics)}: {topic.title}")
+        _, folder, manifest = await prepare_source(
+            client, message_cache, channel=channel,
+            topic_override=(topic.id, topic.title), auto_resume=True,
+            reuse_old=False, target=target,
+        )
+        if not manifest["items"]:
+            continue  # empty source topic: do not create an empty one on the target
+        target_topic_id = await resolve_target_topic(client, target, topic.title, known_topics=target_topics)
+        if getattr(target, "forum", False) and not target_topic_id:
+            raise OrderStop(f"Could not resolve target topic: {topic.title}")
+        await forward_all(client, channel, target, folder, manifest, silent, topic_id=target_topic_id)
+    info("All selected topics copied.", "Secilen tum alt basliklar kopyalandi.", Fore.GREEN)
+
+
 # ---------------------------------------------------------------------------
 # Saved run state, execution and automatic recovery
 # ---------------------------------------------------------------------------
@@ -2218,6 +2297,9 @@ async def execute_plan(client, plan, message_cache):
     mode = plan["mode"]
     if mode == "5":
         await run_all_topics(client, plan, message_cache)
+        return
+    if mode == "4" and plan.get("topic_ids"):
+        await run_forward_topics(client, plan, message_cache)
         return
     folder = MIRRORS_DIR / plan["folder"]
     manifest = load_manifest(folder)  # fresh from disk: it is the source of truth
@@ -2342,6 +2424,39 @@ async def run_plan(client, plan) -> int:
         await asyncio.sleep(delay)
 
 
+async def setup_forward_topics(client, channel, topic_ids):
+    """Mode 4 questions when several source topics were picked."""
+    target = await ask_chat(client, "Target channel to post into", "Gonderilecek hedef kanal")
+    if target.id == channel.id:
+        info("Source and target must differ.", "Kaynak ve hedef farkli olmali.", Fore.RED)
+        return None
+    if getattr(target, "forum", False):
+        info(
+            "Each topic goes into a same-titled topic on the target (created if missing).",
+            "Her alt baslik hedefte ayni isimli alt basliga gider (yoksa olusturulur).",
+        )
+    else:
+        info(
+            "Target is not a forum: the selected topics are posted one after another.",
+            "Hedef forum degil: secilen alt basliklar arka arkaya gonderilecek.",
+            Fore.YELLOW,
+        )
+    silent = ask_yes_no(
+        "Post silently (no notification for each message)?",
+        "Sessiz gonderilsin mi (her mesaj icin bildirim gitmesin)?",
+    )
+    return {
+        "mode": "4",
+        "folder": None,
+        "source_peer": utils.get_peer_id(channel),
+        "target_peer": utils.get_peer_id(target),
+        "topic_ids": topic_ids,
+        "silent": silent,
+        "created": datetime.now(timezone.utc).isoformat(),
+        "finished": False,
+    }
+
+
 async def interactive_setup(client):
     """Ask everything once, up front, and return the plan (or None). The plan is
     saved to run_state.json so a restart never has to ask again."""
@@ -2367,15 +2482,25 @@ async def interactive_setup(client):
         if not folder:
             return None
         channel = None
-    else:
-        channel, folder = await choose_source(client)
-        if mode == "4" and getattr(channel, "noforwards", False):
+    elif mode == "4":
+        channel = await ask_chat(
+            client, "Source channel/group (link, @username, ID or name)", "Kaynak kanal/grup"
+        )
+        if getattr(channel, "noforwards", False):
             info(
                 "This chat has content protection; direct copy will fail. Use mode 3.",
                 "Bu kanal korumali; dogrudan kopyalama calismaz, 3. modu kullanin.",
                 Fore.RED,
             )
             return None
+        picks = await pick_topics(client, channel) if getattr(channel, "forum", False) else None
+        if picks and len(picks) > 1:
+            return await setup_forward_topics(client, channel, [topic_id for topic_id, _ in picks])
+        channel, folder = await choose_source(
+            client, channel, topic_override=picks[0] if picks else (None, None)
+        )
+    else:
+        channel, folder = await choose_source(client)
 
     plan = {
         "mode": mode,
@@ -2411,7 +2536,7 @@ async def main() -> int:
     state = load_state()
     if state and not state.get("finished"):
         if AUTO_MODE or ask_yes_no(
-            f"An earlier run (mode {state.get('mode')}, '{state.get('folder') or 'all topics'}') did not finish. "
+            f"An earlier run (mode {state.get('mode')}, '{state.get('folder') or 'selected topics'}') did not finish. "
             f"Resume it where it stopped?",
             "Onceki islem tamamlanmamis. Kaldigi yerden devam edilsin mi? (Hayir = yeni islem)",
         ):
